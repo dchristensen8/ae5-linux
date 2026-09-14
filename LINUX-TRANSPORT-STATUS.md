@@ -319,3 +319,34 @@ else on the Linux side is validated and staged.
   capture (the 0x70X verbs' address fields) will reveal. Post-bake verification = re-sweep and
   diff, or a targeted read of the captured address. The toolchain for bake verification is now
   fully local and hardware-safe.
+
+## UPDATE CAPTURE-REQ-ANSWER (2026-09-14): it was never a chipio bake
+
+Windows static RE (kd on MEMORY.DMP, CtxHda base `fffff80094930000`) says:
+- **The ring base/size is programmed as a HOST-RAM descriptor the DSP DMAC reads at the ring
+  base** — built by CtxHda RVA `0x32020` (bitfield packing; masks
+  `0xFFFFC0FF`/`0xFC000`/`0x3F00000`/`0x3FFFFFF`/`0x1C71C700`/`0x3FF`; 4 entries × 16 B).
+  The prior "0x70B/0x0D chipio bake" reads were the generic byte-level SCP emitter family
+  (`0x1a280-0x1a800`, verbs 0x70D/0x70B/0xF0B/0x0D/0x05/(0x709,0xF09 in this dump)),
+  **not** a ring bake. The `0xfa92=0x22` "commit token" confirmed as a code-byte no-op
+  (see dma15/16 section). So our chipio ARM injector thesis is void — RIP `ae5_strip_arm_sequence`.
+- Live-capture geometry confirmed (ae5hook5.log): `bufPhys=0x9ce52000`, `ring=32768`, memcpy
+  destinations always `buf + (pos+0xA8)-(..)` → **ring[0x00..0xA7] is the header/descriptor zone
+  that our earlier full-ring fills DESTROYED** (we wrote frames from offset 0). `pos` reads
+  `0x810/0x490/0x4248/0x1158/0x2bc0/0x1db0` (BAR2+0x6104, unreachable on this host).
+- **BAR reconciliation resolved-ish:** `lspci -xxx` shows this card's BAR0=0xf4304000 (16K),
+  BAR1=0, BAR2=0xf4300000 (16K), BAR3-5=0. Pos offset 0x6104 > 16K; **position gating remains
+  unavailable on Linux** regardless of driver workarounds (device-fixed BAR sizes).
+- **Implied fix → dma17:** replicate Windows ring geometry exactly (header zone 0x00..0xA7
+  untouched/zero, frames only at `(pos+0xA8)%0x8000`, zero-fill after drain) and embed the
+  Windows descriptor at ring base once its bytes are captured (they were never dumped).
+
+### dma17: Windows-exact ring geometry (built 2026-09-14)
+Frame at 0xA8 (header zone reserved, tail zero-filled), no invented descriptor. Staged
+`-dma17`. Outcome: anticipated strip stays dark until the descriptor bytes arrive, but this
+removes ring-clobbering from the variable list and gives a stable layout for the diff check.
+Open (synced in CAPTURE-REQ): ASK-A = dump ring[0x000..0x0A7] verbatim; ASK-B = how the DMAC
+learns the ring base (BDLE vs chipio); ASK-C = confirm descriptor at ring+0.
+
+Modules: -dma17 current, then dma16/-dma15 (exram spy/baseline), dma14 (pos harness), dma13
+(ARM injector - now moot), dma12/dma11/dma10 earlier.

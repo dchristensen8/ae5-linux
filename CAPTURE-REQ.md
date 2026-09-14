@@ -84,3 +84,24 @@ Full pre-bake baseline of the data plane captured (see LINUX-TRANSPORT-STATUS.md
 write to** — the sequence translates 1:1 from the table. After we run it we re-sweep and diff;
 the descriptor structure (ring phys base + size 0x8000) will appear as a new cluster. If the
 capture table lists a data-row but not the INTERPRETED address, we only need the raw rows.
+
+## DELTA 2026-09-14 (after CAPTURE-REQ-ANSWER): two byte-level asks remain
+
+Follow-up on your ANSWER (host-RAM descriptor at ring base; no chipio bake). We
+accept the model. Two asks still gate a hardware run:
+
+**ASK-A (the descriptor bytes):** during a live send under ae5hook, dump the ring
+at `bufPhys` for offsets `0x000..0x03F` (16 dwords, dword view) AND `0x040..0x0A7`
+— i.e. the host-RAM descriptor zone built by 0x32020, as actually written
+(pre/post memcpy either way). These 168 bytes are byte-exact gold; we will embed
+them verbatim at ring base on Linux.
+
+**ASK-B (ring-base plumbing):** state how the DSP DMAC is told the ring base —
+the azx BDLE (via commit [vt+0x48]=0x31D30) or a chipio-programmed address — *if
+there is truly no chipio bake*. If it is the BDLE, our `snd_hdac_dsp` stream
+already covers it and only ASK-A remains; if a chipio order exists, its address
+operands (the 0x70X rows) are needed too.
+
+**ASK-C (sanity):** the 0x32020 result goes INTO ring[0x00..] — confirmed by the
+memcpy hook writing at (pos+0xA8) which skips 0x00..0xA7 entirely. Just confirm
+"descriptor lives at ring+0; frames never overlap 0x00..0xA7".

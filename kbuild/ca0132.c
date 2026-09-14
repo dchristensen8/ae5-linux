@@ -8671,71 +8671,45 @@ static void ae5_strip_write_test(struct hda_codec *codec)
 		goto out_free_chan;
 	}
 
-	/* dma14: pure-azx + position-register model (mirror of Windows).
-	 * Windows never runs a DSP DMAC for the strip: the ring is the azx
-	 * stream's host buffer, the card's own engine scans it and publishes
-	 * read position at BAR2+0x6104; the driver gates each frame on pos
-	 * ADVANCE (never a DMA "active" bit), then zero-fills the ring for the
-	 * reset gap (WINDOWS-ANSWERS-2026-09-09 Q2/Q6). Never-tested combo:
-	 * azx bound + routed c4, NO dsp_dma_* at all. Watch whether pos moves. */
-	codec_info(codec, "AE5 strip: dma14 pure-azx+pos model ON "
-			   "(4 frames red/green, pos-gated)\n");
+	/* dma17: Windows-exact RING GEOMETRY (no invented descriptor bytes). Per the
+	 * 2026-09-14 Windows static RE (CAPTURE-REQ-ANSWER.md): the ring base
+	 * carries a host-RAM descriptor the DSP DMAC reads; Windows writes frames
+	 * at (pos + 0xA8) % 0x8000, never touching ring[0..0xA7] (header zone),
+	 * then zero-fills. Our prior runs clobbered the header zone by filling
+	 * from offset 0. Mirror geometry exactly here: header zone stays zero,
+	 * one frame at 0xA8, zero-fill tail. Descriptor bytes themselves are the
+	 * sole missing item (pending Windows ring[0..0x3F] dump). */
+	codec_info(codec, "AE5 strip: dma17 windows-geometry model ON "
+			   "(frame@0xA8, header zone reserved, zero-fill)\n");
 	{
-		unsigned int p0, pc, v2c;
-		int moved;
+		unsigned int v2c;
+		u32 *fh;
+		u32 cwpat[8];
 
-		p0 = ae5_strip_pos(codec);
-		if (p0 == UINT_MAX) {
-			codec_info(codec, "AE5 strip:   WARNING no BAR2+0x6104 map\n");
-			msleep(100);
-		} else {
-			codec_info(codec, "AE5 strip:   pos@start=%08x\n", p0);
-		}
-		for (burst = 0; burst < 4; burst++) {
-			u32 *pp = (u32 *)dmab.area;
-			int ndone = 0;
-			u32 *cw = (burst % 2) ? wgreen : words;
-
+		for (burst = 0; burst < 2; burst++) {
+			/* frame content: 40B zero preamble + 10 LEDs (96k: 10*80 *8B words) */
+			memcpy(cwpat, burst % 2 ? wgreen : words, sizeof(cwpat));
 			memset(dmab.area, 0, 0x8000);
-			while (ndone + 120 <= 0x2000) {
-				pp += 10;               /* 40B preamble (zeros) */
-				for (i = 0; i < 10; i++)
-					memcpy(pp + i * 8, cw, sizeof(words));
-				pp += 80;               /* 10 LEDs * 8 words              */
-				pp += 30;               /* reset gap (zeros)              */
-				ndone += 120;
-			}
+			fh = (u32 *)(dmab.area + 0xA8);
+			for (i = 0; i < 10; i++)
+				memcpy(fh + i * 8, cwpat, sizeof(cwpat));
 			wmb();
 
-			moved = 0;
-			pc = p0;
-			for (i = 0; i < 40; i++) {
-				msleep(100);
-				pc = ae5_strip_pos(codec);
-				if (pc != UINT_MAX && pc != p0) {
-					codec_info(codec, "AE5 strip:   [%d] %s pos "
-						   "%08x -> %08x at %dms\n",
-						   burst, burst % 2 ? "green" : "red",
-						   p0, pc, (i + 1) * 100);
-					moved = 1;
-					break;
-				}
-				if ((i + 1) % 10 == 0) {
-					chipio_read(codec, 0x1900b0, &v2c);
-					codec_info(codec, "AE5 strip:   [%d] pos %08x "
-						   "(unmoved, 0x2c=%08x) t=%dms\n",
-						   burst, pc, v2c, (i + 1) * 100);
-				}
-			}
-			/* Windows commit step: zero-fill the whole ring (reset/off gap). */
+			codec_info(codec, "AE5 strip:   [%d] frame@0xA8 (10 LEDs, %s), waiting 2s\n",
+				   burst, burst % 2 ? "green" : "red");
+			msleep(2000);
+			chipio_read(codec, 0x1900b0, &v2c);
+			codec_info(codec, "AE5 strip:   [%d] done 0x2c=%08x (pos unreadable on "
+				   "this host: BARs 16K)\n", burst, v2c);
+
+			/* Windows commit step: zero-fill tail (reset/off gap). */
 			memset(dmab.area, 0, 0x8000);
 			wmb();
-			codec_info(codec, "AE5 strip:   drain %d %s pos_moved=%d "
-				   "pos=%08x\n",
-				   burst, burst % 2 ? "green" : "red", moved,
-				   pc != UINT_MAX ? pc : 0);
-			p0 = pc;
+			msleep(400);
 		}
+		codec_info(codec, "AE5 strip: dma17 pass complete (chan=%u); "
+			   "descriptor bytes still pending Windows dump\n",
+			   dma_chan);
 	}
 	codec_info(codec, "AE5 strip: pure-azx+pos drain OFF\n");
 
@@ -8770,7 +8744,7 @@ static void ae5_strip_probe_exram(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	const u16 ranges[] = { 0xfa00, 0xfb00 };
-	const u16 data_lo = 0x0000, data_hi = 0x7fff;
+	const u16 data_lo = 0x0000;
 	u32 v;
 	int r, i, nz;
 
