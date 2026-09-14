@@ -223,3 +223,78 @@ sustained drain.
 
 Modules preserved: -dma9 = sustained azx+DMAC (current), -dma8 = 12-burst azx+DMAC, -dma7 =
 pure-azx, -dma6/-dma5 = DMAC-no-trigger, earlier variants.
+
+### UPDATE dma10→dma13 (2026-09-09): engagement found, ring ARM is the gate
+
+- **dma10** bound hda_streamid+fmt into stream-0x18 exram row (row `05 45 08`→`01 45 08`, sticks across
+  reloads) — lanes never go busy, strip dark → lone streamid bind insufficient.
+- **dma11** added `chipio_set_stream_source_dest(0x18, src, 0xd0)` with dual readback (row 0x81f+1
+  AND PARAM_GET, ≤3 tries, commit token 0xfa92=0x22) — accepted try 0 every time.
+- **Connector blocks identified**: alloc `0xfff00` (idx4/tag5) → c0–cb = pre-existing analog-out mux
+  (dest 0x40, tapping = guaranteed no-op; drains complete ~107 polls, no change). Alloc `0xfff000`
+  (idx0/tag1, forced by speaker-test holding idx4) → **c4–cf = our ring's real input**.
+  `src = 0xc0 + (ffs(mask) - 9)`.
+- **The c4 run is the only behavior-changing run**: keyword 0x1900b0 flips
+  `0x0001c800 → 0x00019000` (DSP acknowledges stream-0x18 sourcing c4). Lanes read
+  `0x0001ffc0..0x0001ffcb` (src c0–cb, dest ff "unrouted"). DMAC channel **never retires**.
+
+### dma12: XFRCNT-CCNT probe — no-fetch confirmed (2026-09-09)
+
+Probed CCNT/IRQCNT.CICNT during the c4-pinned burst: `ccn=0x1fff cicn=0xffff` — **frozen for the
+entire 10 s**, never one word fetched, never one interrupt. `bucket f=no-fetch`.
+**Falsifies the "slow sip" theory** (CCNT would have decremented) and the "just wait" theory.
+When source=c0 (audio mux), plain drains complete in ~107 polls (~10 ms); when source=c4 is
+accepted, the DSP's strip consumer gate **backpressures the DMA** because the ring base/size/arm
+was never programmed.
+
+### dma13: captured-ARM drop-in engine (2026-09-09)
+
+`ae5_strip_arm_sequence[]` + `ae5_strip_run_arm()` — empty table (NO invented SCP bytes, per
+directive), runs the captured Windows sequence verbatim once captured. Wired after routing
+acceptance; logs "arm table empty (0 steps) - awaiting Windows capture" (verified live). c4
+behavior reproduces bit-for-bit (engaged, no-fetch, abort -19).
+
+### Conclusion now (fully evidenced)
+
+The single untested step is now precisely scoped: **the ring-base/size + arm program** that
+Windows sends once at LED-stream object setup (chipio 0x70x + SCP via COM/vtable; commit fn
+0x31D80, RAM-descriptor setup 0x32020, vt+0x28→0x8000; IDs 0x70D/0x70B/0xF0C/0x70C/0xF0B/0x0D).
+Static RE was already pushed to its limit (windriver/ANALYSIS.md §16). The exact ARG bytes were
+never live-captured → delivered `CAPTURE-REQ.md` to the Windows side (both machines have it); the
+Linux injector is ready to accept them. See WINDOWS-CONSULT-SYNOPSIS.md §6 for the full open-question list.
+
+Modules preserved: -dma13 = ARM-injector + empty table (current), -dma12 = CCNT probe, -dma11 =
+slow-sink/serial variants, -dma10/-dma9/-dma8, earlier variants.
+
+## UPDATE dma14 + Windows answers on-stream (2026-09-13)
+
+### Windows ANSWERS-2026-09-09 incorporated
+- **Q2/Q6:** Windows never gates on a DMA active bit. Per send: write frame to host ring →
+  spin-wait **position advance (BAR2+0x6104)** → commit → **zero-fill the whole ring** (reset
+  gap). A transfer staying active for seconds = normal engagement. → falsifies our sustained-fill
+  audit model; the azx stream position buffer is NOT the gate — the card's own scan pointer is.
+- **Q3:** stream 0x18 confirmed as the ASI strip stream.
+- **Q1 (naming corrected):** the bake site is **CtxHda RVA `0x1a454`** (NOT CtxHdb — that is the
+  GUID-check factory). Statically pinned, never arg-captured; recoverable by static RE of the
+  crash dump (base `fffff801846f0000`), pending kd elevation on the Windows box. Exact
+  `0x70D.../0x0D` arg bytes are the open deliverable.
+
+### dma14: pure-azx + position-register harness (Windows commit model)
+- Replaced the dma12 DMAC drain with a **pure-azx + pos-gated** model: azx bound + routed c4,
+  **no dsp_dma_\* at all**, one frame per iteration, wait pos advance (100 ms polls, ~4 s cap),
+  then zero-fill the ring. Added `pos_base` (`pci_iomap_range(BAR2, 0x6104, 4)`) + `ae5_strip_pos()`.
+- Build: clean (unused-var warnings only). Staged `-dma14` and reloaded.
+- **Run result: pos is physically unreachable on this host.** `pos_base` mapping returned NULL:
+  this card's own BAR2 is only **16K (`0xf4300000..0xf4303fff`)**, so offset `0x6104` (>`0x4000`)
+  does not exist, while the Windows box's BAR window is ≥ `0x6108`. Reads log `0xffffffff`
+  (= UINT_MAX placeholder). Everything else in the run matches dma13 bit-for-bit (c4 accepted
+  try 0, ROUTING ACCEPTED, keyword `0x00019000` held, arm table empty, no crash, graceful skip).
+- **Open reconciliation ask added to CAPTURE-REQ.md:** dump the AE-5's full BAR set (base+size
+  per BAR) on the Windows box to pin down whether (a) the same SKU exposes a bigger window there
+  (firmware/BIOS diff → pos polling forever unavailable here) or (b) Windows' "BAR2" is a
+  different Linux BAR index (→ poll from the right window).
+
+### Current wall (single untested step, unchanged)
+Ring-base/size + **ARM bake** bytes from CtxHda RVA `0x1a454` (static RE, kd pending) feeding
+`ae5_strip_arm_sequence[]` (dma13 runner) + dma14 harness = full Windows-mirror path. Everything
+else on the Linux side is validated and staged.

@@ -1145,6 +1145,7 @@ struct ca0132_spec {
 	 */
 	bool use_pci_mmio;
 	void __iomem *mem_base;
+	void __iomem *pos_base;	/* dma14: BAR2+0x6104 strip ring position reg */
 
 	/*
 	 * Whether or not to use the alt functions like alt_select_out,
@@ -8389,6 +8390,97 @@ static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
 	return dsp ? dsp : (z0 ? z0 : first);
 }
 
+/* dma13: run-the-captured-ARM engine. The Windows driver programs the strip
+	 * ring base/size and arms the serializer ONCE at object setup through
+	 * chipio verbs (0x70x) + SCP messages (windriver/AE-5-protocol-capture
+	 * .md: commit fn 0x31D80, RAM-descriptor setup 0x32020, vt+0x28 ring-size
+	 * query; IDs 0x70D/0x70B/0xF0C/0x70C/0xF0B/0x0D). The exact argument
+	 * bytes were never live-captured (factory first-send path). Until they
+	 * are, the table is EMPTY - no invented bytes. Captured sequence drops
+	 * into ae5_strip_arm_sequence verbatim and runs here. */
+enum ae5_arm_op {
+	AE5_OP_VERB_WRITE = 1,
+	AE5_OP_VERB_READ_VERIFY,
+	AE5_OP_SCP_SET,
+	AE5_OP_SCP_GET,
+	AE5_OP_EXRAM_WRITE,
+};
+
+struct ae5_arm_step {
+	unsigned int op;
+	unsigned int a, b, c;
+	unsigned int len;
+	unsigned int data[16];
+};
+
+static const struct ae5_arm_step ae5_strip_arm_sequence[] = {
+	/* e.g. AE5_OP_VERB_WRITE, 0x190080, 0x... , 0, 0, {} */
+};
+
+static void ae5_strip_run_arm(struct hda_codec *codec)
+{
+	unsigned int i, j, rv = 0, rl;
+	int status, r;
+
+	if (!ARRAY_SIZE(ae5_strip_arm_sequence)) {
+		codec_info(codec, "AE5 strip: arm table empty (0 steps) - "
+			   "awaiting Windows capture\n");
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(ae5_strip_arm_sequence); i++) {
+		const struct ae5_arm_step *s = &ae5_strip_arm_sequence[i];
+
+		status = 0;
+		switch (s->op) {
+		case AE5_OP_VERB_WRITE:
+			status = chipio_write(codec, s->a, s->b);
+			break;
+		case AE5_OP_VERB_READ_VERIFY:
+			status = chipio_read(codec, s->a, &rv);
+			codec_info(codec, "AE5 strip:   arm[%u] read %08x=%08x "
+				   "(want %08x)\n", i, s->a, rv, s->b);
+			break;
+		case AE5_OP_SCP_SET:
+			status = dspio_scp(codec, s->a, s->b, s->c, SCP_SET,
+					   s->data, s->len, NULL, NULL);
+			break;
+		case AE5_OP_SCP_GET:
+			rl = sizeof(rv);
+			status = dspio_scp(codec, s->a, s->b, s->c, SCP_GET,
+					   NULL, 0, &rv, &rl);
+			codec_info(codec, "AE5 strip:   arm[%u] scp get rv=%u\n",
+				   i, rv);
+			break;
+		case AE5_OP_EXRAM_WRITE:
+			chipio_8051_write_exram(codec, s->a, s->b);
+			break;
+		default:
+			status = -EINVAL;
+			break;
+		}
+		codec_info(codec, "AE5 strip: arm[%u] op=%u a=%08x b=%08x c=%08x "
+			   "len=%u -> %d\n", i, s->op, s->a, s->b, s->c,
+			   s->len, status);
+		for (j = 0; j < s->len / 4 && j < 8; j++)
+			codec_info(codec, "AE5 strip:   arm[%u] data[%u]=%08x\n",
+				   i, j, s->data[j]);
+	}
+	r = 0;
+}
+
+/* dma14: card-side strip ring read-position (BAR2+0x6104 = Win 0xF43FE104).
+ * The Windows driver gates each frame on THIS advancing past the frame — never
+ * on a DMA "active" bit (WINDOWS-ANSWERS-2026-09-09 Q2/Q6). Returns UINT_MAX
+ * if the mapping is absent. Read-only, fixed offset, no scan. */
+static unsigned int ae5_strip_pos(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	if (!spec->pos_base)
+		return UINT_MAX;
+	return readl(spec->pos_base);
+}
+
 static void ae5_strip_write_test(struct hda_codec *codec)
 {
 	struct snd_dma_buffer dmab;
@@ -8398,8 +8490,7 @@ static void ae5_strip_write_test(struct hda_codec *codec)
 	u32 words[8], wgreen[8];
 	unsigned int dsp_addx, dbadr, dma_chan;
 	bool code, yram;
-	int burst, i, status, polls;
-	int dma_status = -ENODEV;
+	int burst, i, status;
 	unsigned int src_conn;
 
 	codec_info(codec, "AE5 strip: TEST BUILD dma11\n");
@@ -8547,6 +8638,12 @@ static void ae5_strip_write_test(struct hda_codec *codec)
 		}
 	}
 
+	/* dma13: run the captured ARM sequence (ring base/size/arm) if present.
+	 * The c4 route engages but the DMAC never fetches (CCNT frozen) until the
+	 * strip DMA engine is told our ring base - this injects the exact Windows
+	 * bytes once the Windows side live-captures them (empty until then). */
+	ae5_strip_run_arm(codec);
+
 	/* Start the azx source stream ON before arming DSP DMA, so the DSP
 	 * DMAC actually reads real ring data (dma5/dma6 never triggered the
 	 * HDA stream -> drains "completed" on idle data). */
@@ -8574,83 +8671,73 @@ static void ae5_strip_write_test(struct hda_codec *codec)
 		goto out_free_chan;
 	}
 
-	/* Slow-sink drain (routed stream 0x18): the WS2812-timed sink sips each
-	 * 0x2000-word burst at the LED bit clock (tens-to-hundreds of ms vs ~10ms
-	 * for the audio path), so run FEW, LONG bursts and WAIT for each to
-	 * actually complete. 4 bursts, red->green->red->green, ~20s cap total. */
-	codec_info(codec, "AE5 strip: slow-sink drain ON (4 x up-to-4s, red/green)\n");
-	for (burst = 0; burst < 4; burst++) {
-		u32 *pp = (u32 *)dmab.area;
-		int ndone = 0;
-		u32 *cw = (burst % 2) ? wgreen : words;
+	/* dma14: pure-azx + position-register model (mirror of Windows).
+	 * Windows never runs a DSP DMAC for the strip: the ring is the azx
+	 * stream's host buffer, the card's own engine scans it and publishes
+	 * read position at BAR2+0x6104; the driver gates each frame on pos
+	 * ADVANCE (never a DMA "active" bit), then zero-fills the ring for the
+	 * reset gap (WINDOWS-ANSWERS-2026-09-09 Q2/Q6). Never-tested combo:
+	 * azx bound + routed c4, NO dsp_dma_* at all. Watch whether pos moves. */
+	codec_info(codec, "AE5 strip: dma14 pure-azx+pos model ON "
+			   "(4 frames red/green, pos-gated)\n");
+	{
+		unsigned int p0, pc, v2c;
+		int moved;
 
-		memset(dmab.area, 0, 0x8000);
-		while (ndone + 120 <= 0x2000) {
-			pp += 10;               /* 40B preamble (zeros) */
-			for (i = 0; i < 10; i++)
-				memcpy(pp + i * 8, cw, sizeof(words));
-			pp += 80;               /* 10 LEDs * 8 words              */
-			pp += 30;               /* reset gap (zeros)              */
-			ndone += 120;
+		p0 = ae5_strip_pos(codec);
+		if (p0 == UINT_MAX) {
+			codec_info(codec, "AE5 strip:   WARNING no BAR2+0x6104 map\n");
+			msleep(100);
+		} else {
+			codec_info(codec, "AE5 strip:   pos@start=%08x\n", p0);
 		}
-		wmb();
+		for (burst = 0; burst < 4; burst++) {
+			u32 *pp = (u32 *)dmab.area;
+			int ndone = 0;
+			u32 *cw = (burst % 2) ? wgreen : words;
 
-		status = dsp_dma_setup_common(codec, 0x190080, dma_chan,
-					      port_map_mask, false);
-		if (status < 0) {
-			dma_status = status;
-			codec_info(codec, "AE5 strip:   common %d -> %d\n", burst, status);
-			break;
-		}
-		status = dsp_dma_setup(codec, 0x190080, 0x2000, dma_chan);
-		if (status < 0) {
-			dma_status = status;
-			codec_info(codec, "AE5 strip:   setup %d -> %d\n", burst, status);
-			break;
-		}
-		status = dsp_dma_start(codec, dma_chan, false);
-		if (status < 0) {
-			dma_status = status;
-			codec_info(codec, "AE5 strip:   start %d -> %d\n", burst, status);
-			break;
-		}
-		polls = 0;
-		while (dsp_is_dma_active(codec, dma_chan) && polls < 400) {
-			udelay(100);
-			polls++;
-		}
-		if (dsp_is_dma_active(codec, dma_chan)) {
-			/* slow sink: extend the wait in 100ms steps to ~4s, then
-			 * give up only if it is still pinned (genuine stall). */
-			for (i = 0; dsp_is_dma_active(codec, dma_chan) && i < 36; i++) {
+			memset(dmab.area, 0, 0x8000);
+			while (ndone + 120 <= 0x2000) {
+				pp += 10;               /* 40B preamble (zeros) */
+				for (i = 0; i < 10; i++)
+					memcpy(pp + i * 8, cw, sizeof(words));
+				pp += 80;               /* 10 LEDs * 8 words              */
+				pp += 30;               /* reset gap (zeros)              */
+				ndone += 120;
+			}
+			wmb();
+
+			moved = 0;
+			pc = p0;
+			for (i = 0; i < 40; i++) {
 				msleep(100);
-				polls += 10;
+				pc = ae5_strip_pos(codec);
+				if (pc != UINT_MAX && pc != p0) {
+					codec_info(codec, "AE5 strip:   [%d] %s pos "
+						   "%08x -> %08x at %dms\n",
+						   burst, burst % 2 ? "green" : "red",
+						   p0, pc, (i + 1) * 100);
+					moved = 1;
+					break;
+				}
+				if ((i + 1) % 10 == 0) {
+					chipio_read(codec, 0x1900b0, &v2c);
+					codec_info(codec, "AE5 strip:   [%d] pos %08x "
+						   "(unmoved, 0x2c=%08x) t=%dms\n",
+						   burst, pc, v2c, (i + 1) * 100);
+				}
 			}
+			/* Windows commit step: zero-fill the whole ring (reset/off gap). */
+			memset(dmab.area, 0, 0x8000);
+			wmb();
+			codec_info(codec, "AE5 strip:   drain %d %s pos_moved=%d "
+				   "pos=%08x\n",
+				   burst, burst % 2 ? "green" : "red", moved,
+				   pc != UINT_MAX ? pc : 0);
+			p0 = pc;
 		}
-		{
-			unsigned int lane, v, v2c;
-			u32 wl[12];
-
-			for (lane = 0; lane < 12; lane++) {
-				chipio_read(codec, 0x190080 + lane * 4, &v);
-				wl[lane] = v;
-			}
-			chipio_read(codec, 0x1900b0, &v2c);
-			codec_info(codec,
-				   "AE5 strip:   drain %d %s still_active=%d polls=%d lanes %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x (0x2c=%08x)\n",
-				   burst, burst % 2 ? "green" : "red",
-				   dsp_is_dma_active(codec, dma_chan), polls,
-				   wl[0], wl[1], wl[2], wl[3], wl[4], wl[5],
-				   wl[6], wl[7], wl[8], wl[9], wl[10], wl[11], v2c);
-		}
-		if (dsp_is_dma_active(codec, dma_chan)) {
-			codec_info(codec, "AE5 strip:   drain %d STILL ACTIVE after ~4s "
-				   "(genuine stall) -> aborting\n", burst);
-			break;
-		}
-		msleep(400);
 	}
-	codec_info(codec, "AE5 strip: slow-sink drain OFF (last=%d)\n", dma_status);
+	codec_info(codec, "AE5 strip: pure-azx+pos drain OFF\n");
 
 out_free_chan:
 	dspio_free_dma_chan(codec, dma_chan);
@@ -9993,6 +10080,10 @@ static void ca0132_free(struct hda_codec *codec)
 
 	snd_hda_power_down(codec);
 #ifdef CONFIG_PCI
+	if (spec->pos_base) {
+		pci_iounmap(codec->bus->pci, spec->pos_base);
+		spec->pos_base = NULL;
+	}
 	if (spec->mem_base)
 		pci_iounmap(codec->bus->pci, spec->mem_base);
 #endif
@@ -10380,6 +10471,12 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		if (spec->mem_base == NULL) {
 			codec_warn(codec, "pci_iomap failed! Setting quirk to QUIRK_NONE.");
 			codec->fixup_id = QUIRK_NONE;
+		} else {
+			/* dma14: single fixed read-only mapping of the strip
+			 * ring position register (BAR2+0x6104, = Win 0xF43FE104).
+			 * Read-only, no scan (scanning BAR2 crashes both OSes). */
+			spec->pos_base = pci_iomap_range(codec->bus->pci, 2,
+							  0x6104, 4);
 		}
 	}
 #endif

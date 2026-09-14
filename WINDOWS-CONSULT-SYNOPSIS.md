@@ -114,3 +114,23 @@ Card: AE-5 base, PCI `1102:0012`, alsa driver `snd-hda-codec-ca0132`.
   the active flag is meaningless; then multi-second feeds should light the strip.
 - If neither: new hypothesis required — the strip path on Linux may need a different stream
   route than stream 0x18 alt source, or a ring-base write we haven't done (see §14 of HANDOFF).
+## 8. UPDATE after WINDOWS-ANSWERS-2026-09-09 (2026-09-13)
+
+Windows answered Q2/Q6/Q3/Q4 with borrowable conclusions:
+- **Q2/Q6 resolved:** Windows never gates on a DMA active bit. Per send: write frame to
+  host ring → **spin-wait on position advance (BAR2+0x6104)** → commit kick → zero-fill ring
+  (reset gap). Sustained feed is not the Windows model (confirms our dma9 falsification).
+- **Q3:** stream 0x18 is confirmed as the ASI strip stream (firmware comment: "used to change
+  colors on the external LED strip"); nothing contradicts it.
+- **Q4:** our c4 keyword flip + non-retiring drain IS interpreted as engagement — we are likely
+  on the right route; the missing piece is the bake (Q1), not the route.
+- **Q1 (naming + status corrected):** `CtxHda` RVA `0x1a454` (NOT CtxHdb) is the SCP sequence
+  emitter = the real bake site; statically pinned, never argument-captured. Recoverable by
+  static RE of the Windows crash dump (`MEMORY.DMP`, module base `fffff801846f0000`, kd/EWDK
+  — pending elevation). Windows will deliver the exact `0x70D/0x70E/0x70C/0x70F/0x710/0x70A`
+  argument sequence. **Deliverable on their side, not yet shipped.**
+- We acted: dma12 (CCNT probe) proved the never-fetch, dma13 (captured-ARM injector; empty
+  table = no invented bytes), dma14 (pure-azx pos-gated harness = Windows commit model). Run
+  results: c4 route holds bit-for-bit; **position register at BAR2+0x6104 is out of reach on
+  this host** (card BAR2 is 16K here; 0x6104 > 0x4000) → added BAR-size reconciliation ask
+  to CAPTURE-REQ.md.
