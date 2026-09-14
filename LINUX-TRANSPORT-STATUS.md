@@ -348,5 +348,12 @@ removes ring-clobbering from the variable list and gives a stable layout for the
 Open (synced in CAPTURE-REQ): ASK-A = dump ring[0x000..0x0A7] verbatim; ASK-B = how the DMAC
 learns the ring base (BDLE vs chipio); ASK-C = confirm descriptor at ring+0.
 
+### dma17 run (2026-09-14)
+Ran clean: c4 route accepted try 0 (mask 0xfff000, speaker-test holding idx4), lanes
+`0x0001ffc0..cb`, keyword `0x00019000` throughout, two frames placed at ring+0xA8 (header
+zone untouched), tail zero-filled, no crash. Strip dark as predicted (no descriptor). Ring
+clobbering eliminated from the variable list; geometry now matches Windows exactly. Awaiting
+ASK-A bytes to embed at ring+0.
+
 Modules: -dma17 current, then dma16/-dma15 (exram spy/baseline), dma14 (pos harness), dma13
 (ARM injector - now moot), dma12/dma11/dma10 earlier.
