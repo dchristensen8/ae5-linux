@@ -298,3 +298,24 @@ slow-sink/serial variants, -dma10/-dma9/-dma8, earlier variants.
 Ring-base/size + **ARM bake** bytes from CtxHda RVA `0x1a454` (static RE, kd pending) feeding
 `ae5_strip_arm_sequence[]` (dma13 runner) + dma14 harness = full Windows-mirror path. Everything
 else on the Linux side is validated and staged.
+
+## UPDATE dma15/dma16 (2026-09-14): 8051-exram spy + full pre-bake baseline
+
+- **`chipio_8051_read_exram()` (DATA_READ 0x708) is a validated, safe, full-address-space readback
+  spy** (used by the in-tree driver itself). dma15 ran 0xfa00-0xfbff; dma16 swept the entire
+  data plane 0x0000-0x7fff. No BAR2 scanning involved.
+- **`0xf000-0xffff` is 8051 MACHINE CODE**, not a descriptor: 0xfa00-0xfbff is dense opcode
+  sequences (`90 d1 65` = MOV DPTR,#imm16, `02` = LJMP, `f6` = MOV @R0,A, `22` = RET), each byte
+  nonzero.
+- **⚠ CORRECTION (false success retired):** the earlier "commit token
+  `chipio_8051_write_exram(0xfa92, 0x22)`" was NOT an arm signal. `[fa92]` reads `22` natively —
+  it is the `RET` opcode of a 8051 subroutine. Writing 0x22 there was writing a code byte back
+  over itself (no-op). Any theory built on that "token" is void.
+- **Pre-bake XRAM data-plane map (0x0000-0x7fff):** dense firmware regions `0x0000` and
+  `0x0700-0x1dff`; a single sparse control-variable cluster `0x0c00-0x0dff` (33 nonzero bytes:
+  small counters/flags `01..08`, `80`, `f9`, `3c` — no ring size/base); everything else zero.
+- **Conclusion:** no ring descriptor exists anywhere pre-bake. The descriptor (containing the
+  ring phys base + size) must be written by the bake at its address operand — which the Windows
+  capture (the 0x70X verbs' address fields) will reveal. Post-bake verification = re-sweep and
+  diff, or a targeted read of the captured address. The toolchain for bake verification is now
+  fully local and hardware-safe.

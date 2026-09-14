@@ -76,3 +76,11 @@ runner executes and logs each step. No Linux-side code changes needed after the 
 dma14 already runs the pure-azx pos-gated one-frame write/zero-fill harness (Windows commit
 model) and logs "pos@start" + per-burst pos samples — it is the exact harness the bake bytes
 plug into.
+## EXTRA (2026-09-14): bake verification is now fully local — the address operands are gold
+
+We built and validated a complete 8051-EXRAM readback spy (`chipio_8051_read_exram`, in-tree).
+Full pre-bake baseline of the data plane captured (see LINUX-TRANSPORT-STATUS.md dma15/dma16).
+**When you capture the bake, the ADDRESS operand bytes inside the 0x70X record rows are what we
+write to** — the sequence translates 1:1 from the table. After we run it we re-sweep and diff;
+the descriptor structure (ring phys base + size 0x8000) will appear as a new cluster. If the
+capture table lists a data-row but not the INTERPRETED address, we only need the raw rows.

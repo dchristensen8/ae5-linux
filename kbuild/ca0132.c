@@ -8761,6 +8761,89 @@ static ssize_t ae5_strip_test_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(ae5_strip_test);
 
+/* dma15: 8051-exram baseline sweeper. Safe spy (fixed range, no BAR2 scan).
+ * chipio_8051_read_exram() reads any 8051-exram byte (DATA_READ 0x708).
+ * Goal: confirm the 0xfa92=0x22 commit token persists (validates the spy) and
+ * fingerprint the descriptor-constants region around it so a future bake can be
+ * verified by diff. Logs nonzero bytes; always logs the token row. */
+static void ae5_strip_probe_exram(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	const u16 ranges[] = { 0xfa00, 0xfb00 };
+	const u16 data_lo = 0x0000, data_hi = 0x7fff;
+	u32 v;
+	int r, i, nz;
+
+	if (!spec)
+		return;
+	snd_hda_power_up(codec);
+	/* dma16: full pre-bake baseline of the 8051 XRAM data plane
+	 * (0x0000-0x7fff; 0xe000+ is program space, swept above as code).
+	 * Block-summarized to bound output: print nonzero rows only for sparse
+	 * blocks (nz<64), else a one-line dense-block count. */
+	for (r = 0; r < 0x80; r++) {
+		u16 base = data_lo + (r << 8);
+		int dense = 0;
+
+		guard(mutex)(&spec->chipio_mutex);
+		nz = 0;
+		for (i = 0; i < 0x100; i++) {
+			u16 addr = base + i;
+
+			chipio_8051_read_exram(codec, addr, &v);
+			if (v)
+				nz++;
+			if (nz == 64)
+				dense = 1;
+		}
+		if (dense) {
+			codec_info(codec, "AE5 exram: block %04x-%04x dense (%d nz)\n",
+				   base, base + 0xff, nz);
+			continue;
+		}
+		for (i = 0; i < 0x100; i++) {
+			u16 addr = base + i;
+
+			chipio_8051_read_exram(codec, addr, &v);
+			if (v)
+				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
+					   addr, v);
+		}
+	}
+	for (r = 0; r < 2; r++) {
+		nz = 0;
+		guard(mutex)(&spec->chipio_mutex);
+		for (i = 0; i < 0x100; i++) {
+			u16 addr = ranges[r] + i;
+
+			chipio_8051_read_exram(codec, addr, &v);
+			if (v == 0 && addr != 0xfa92)
+				continue;
+			if (addr >= 0xfa80 && addr <= 0xfabf)
+				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
+					   addr, v);
+			else if (v)
+				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
+					   addr, v);
+			nz++;
+		}
+		codec_info(codec, "AE5 exram: sweep %04x-%04x nonzero=%d\n",
+			   ranges[r], ranges[r] + 0xff, nz);
+	}
+	snd_hda_power_down(codec);
+}
+
+static ssize_t ae5_strip_probe_store(struct device *dev,
+			struct device_attribute *attr, const char *buf,
+			size_t count)
+{
+	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
+	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	ae5_strip_probe_exram(codec);
+	return count;
+}
+static DEVICE_ATTR_WO(ae5_strip_probe);
+
 static void ae5_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -10026,6 +10109,9 @@ static int ca0132_init(struct hda_codec *codec)
 		int err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_test);
 		if (err)
 			codec_warn(codec, "AE5 strip: create test sysfs failed %d\n", err);
+		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_probe);
+		if (err)
+			codec_warn(codec, "AE5 strip: create probe sysfs failed %d\n", err);
 	}
 
 	return 0;
@@ -10377,6 +10463,7 @@ static void ca0132_codec_remove(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 
 	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_test);
+	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_probe);
 	if (ca0132_quirk(spec) == QUIRK_ZXR_DBPRO)
 		return dbpro_free(codec);
 	else
