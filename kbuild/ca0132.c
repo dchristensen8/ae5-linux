@@ -34,6 +34,10 @@
 #include <sound/tlv.h>
 #endif
 
+#include <linux/ktime.h>
+#include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
+
 #define FLOAT_ZERO	0x00000000
 #define FLOAT_ONE	0x3f800000
 #define FLOAT_TWO	0x40000000
@@ -1145,7 +1149,6 @@ struct ca0132_spec {
 	 */
 	bool use_pci_mmio;
 	void __iomem *mem_base;
-	void __iomem *pos_base;	/* dma14: BAR2+0x6104 strip ring position reg */
 
 	/*
 	 * Whether or not to use the alt functions like alt_select_out,
@@ -7897,13 +7900,17 @@ static void ae5_post_dsp_register_set(struct hda_codec *codec)
 	writeb(0xff, spec->mem_base + 0x304);
 	writeb(0xff, spec->mem_base + 0x304);
 	writeb(0xff, spec->mem_base + 0x304);
-	writeb(0x00, spec->mem_base + 0x100);
+	if (spec->mem_base)
+		writel(0x0000070f, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	writeb(0x00, spec->mem_base + 0x100);
+	if (spec->mem_base)
+		writel(0x0000070f, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	writeb(0x00, spec->mem_base + 0x100);
+	if (spec->mem_base)
+		writel(0x0000070f, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	writeb(0x00, spec->mem_base + 0x100);
+	if (spec->mem_base)
+		writel(0x0000070f, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
 
 	ca0113_mmio_command_set(codec, 0x30, 0x2b, 0x3f);
@@ -7953,11 +7960,11 @@ static void ae5_post_dsp_stream_setup(struct hda_codec *codec)
 	chipio_set_stream_source_dest(codec, 0x5, 0x43, 0x0);
 
 	chipio_set_stream_source_dest(codec, 0x18, 0x9, 0xd0);
-	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_96_000);
-	chipio_set_stream_channels(codec, 0x18, 6);
+	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_44_100);
+	chipio_set_stream_channels(codec, 0x18, 2);
 	chipio_set_stream_control(codec, 0x18, 1);
 
-	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 4);
+	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 7);
 
 	chipio_8051_write_pll_pmu_no_mutex(codec, 0x43, 0xc7);
 
@@ -8304,70 +8311,32 @@ static void sbz_setup_defaults(struct hda_codec *codec)
 }
 
 /*
- * Setup default parameters for the Sound BlasterX AE-5 DSP.
+ * Sound BlasterX AE-5 External WS2812B RGB LED Strip Transport
  */
-static void ae5_strip_probe_port(struct hda_codec *codec)
-{
-	unsigned int offset;
-	int tries = 20;
-
-	do {
-		chipio_8051_read_exram(codec, 0x1578 + 0x18, &offset);
-		if (offset != 0xff)
-			break;
-		usleep_range(1000, 2000);
-	} while (--tries);
-
-	if (offset == 0xff) {
-		codec_dbg(codec, "AE5 strip: stream 0x18 port never allocated\n");
-		return;
-	}
-
-	codec_info(codec, "AE5 strip: stream 0x18 port offset=0x%x -> base=0x%x\n",
-		   offset, offset * 4 + 0x190000);
-}
-
 static void ae5_strip_encode_24(u32 u, u32 *words)
 {
-	int i8;
-	for (i8 = 23; i8 >= 0; i8 -= 3) {
-		int b0 = (u >> i8) & 1;
-		int b1 = (u >> (i8 - 1)) & 1;
-		int b2 = (u >> (i8 - 2)) & 1;
-		int u4 = b0 ? 3 : 0;
-		int u5 = b1 ? 3 : 0;
-		int u6 = b2 ? 3 : 0;
-		*words++ = (u32)(((u6 << 10) | ((u6 | 0xc) << 12)) |
-				 ((u5 << 18) | ((u5 | 0xc) << 20)) |
-				 ((u4 << 26) | ((u4 | 0xfffffffc) << 28)));
+	/* Bit-for-bit exact encoding matching CtxHda.sys FUN_00042944:
+	 * 24-bit pixel -> 4 x 32-bit audio words (6 bits per word).
+	 * Hardware audio serializer transmits MSB first (bits 31 down to 0).
+	 * For word i (i8 = 23, 17, 11, 5), bit_idx 0..5 (MSB to LSB within the word)
+	 * is placed at n = 29 - bit_idx * 4 (bits 29, 25, 21, 17, 13, 9):
+	 *   out |= (bit << n) | ((bit | 2) << (n + 1))
+	 * Bit 0 -> 0b010 (375ns high, 1042ns low)
+	 * Bit 1 -> 0b111 (1083ns high, 333ns low)
+	 */
+	int i8 = 23;
+	int i;
+	for (i = 0; i < 4; i++) {
+		u32 out = 0;
+		int bit_idx;
+		for (bit_idx = 0; bit_idx < 6; bit_idx++) {
+			int bit = (u >> (i8 - bit_idx)) & 1;
+			int n = 29 - bit_idx * 4;
+			out |= (u32)(bit << n) | ((u32)(bit | 2) << (n + 1));
+		}
+		words[i] = out;
+		i8 -= 6;
 	}
-}
-
-/* Visual-only write test: arm stream 0x18, write a full frame
-   (40-byte preamble + encoded red words) to the port base. */
-/* Dry-run: verify 0x190080 maps through the new port-region case in
-   dsp_chip_to_dsp_addx(), and that the DBADR the DMA would use = 0x40. */
-static void ae5_strip_dryrun(struct hda_codec *codec)
-{
-	bool code, yram;
-	unsigned int dsp_addx, addr_field;
-
-	dsp_addx = dsp_chip_to_dsp_addx(0x190080, &code, &yram);
-
-	if (dsp_addx == INVALID_CHIP_ADDRESS) {
-		codec_info(codec, "AE5 strip: DRYRUN 0x190080 -> INVALID (range gate)\n");
-		return;
-	}
-
-	addr_field = dsp_addx << DSPDMAC_DMACFG_DBADR_LOBIT;
-	if (!code) {
-		addr_field <<= 1;
-		if (yram)
-			addr_field |= (1 << DSPDMAC_DMACFG_DBADR_LOBIT);
-	}
-
-	codec_info(codec, "AE5 strip: DRYRUN 0x190080 -> dsp_addx=0x%x code=%d yram=%d DMACFG_DBADR=0x%x (expect 0x40)\n",
-		   dsp_addx, code, yram, addr_field);
 }
 
 static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
@@ -8390,343 +8359,170 @@ static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
 	return dsp ? dsp : (z0 ? z0 : first);
 }
 
-/* dma13: run-the-captured-ARM engine. The Windows driver programs the strip
-	 * ring base/size and arms the serializer ONCE at object setup through
-	 * chipio verbs (0x70x) + SCP messages (windriver/AE-5-protocol-capture
-	 * .md: commit fn 0x31D80, RAM-descriptor setup 0x32020, vt+0x28 ring-size
-	 * query; IDs 0x70D/0x70B/0xF0C/0x70C/0xF0B/0x0D). The exact argument
-	 * bytes were never live-captured (factory first-send path). Until they
-	 * are, the table is EMPTY - no invented bytes. Captured sequence drops
-	 * into ae5_strip_arm_sequence verbatim and runs here. */
-enum ae5_arm_op {
-	AE5_OP_VERB_WRITE = 1,
-	AE5_OP_VERB_READ_VERIFY,
-	AE5_OP_SCP_SET,
-	AE5_OP_SCP_GET,
-	AE5_OP_EXRAM_WRITE,
-};
+#define AE5_STRIP_MAX_LEDS 100
 
-struct ae5_arm_step {
-	unsigned int op;
-	unsigned int a, b, c;
-	unsigned int len;
-	unsigned int data[16];
-};
+static u32 ae5_strip_cur_colors[AE5_STRIP_MAX_LEDS];
+static int ae5_strip_cur_num_leds = 10;
 
-static const struct ae5_arm_step ae5_strip_arm_sequence[] = {
-	/* e.g. AE5_OP_VERB_WRITE, 0x190080, 0x... , 0, 0, {} */
-};
-
-static void ae5_strip_run_arm(struct hda_codec *codec)
-{
-	unsigned int i, j, rv = 0, rl;
-	int status, r;
-
-	if (!ARRAY_SIZE(ae5_strip_arm_sequence)) {
-		codec_info(codec, "AE5 strip: arm table empty (0 steps) - "
-			   "awaiting Windows capture\n");
-		return;
-	}
-	for (i = 0; i < ARRAY_SIZE(ae5_strip_arm_sequence); i++) {
-		const struct ae5_arm_step *s = &ae5_strip_arm_sequence[i];
-
-		status = 0;
-		switch (s->op) {
-		case AE5_OP_VERB_WRITE:
-			status = chipio_write(codec, s->a, s->b);
-			break;
-		case AE5_OP_VERB_READ_VERIFY:
-			status = chipio_read(codec, s->a, &rv);
-			codec_info(codec, "AE5 strip:   arm[%u] read %08x=%08x "
-				   "(want %08x)\n", i, s->a, rv, s->b);
-			break;
-		case AE5_OP_SCP_SET:
-			status = dspio_scp(codec, s->a, s->b, s->c, SCP_SET,
-					   s->data, s->len, NULL, NULL);
-			break;
-		case AE5_OP_SCP_GET:
-			rl = sizeof(rv);
-			status = dspio_scp(codec, s->a, s->b, s->c, SCP_GET,
-					   NULL, 0, &rv, &rl);
-			codec_info(codec, "AE5 strip:   arm[%u] scp get rv=%u\n",
-				   i, rv);
-			break;
-		case AE5_OP_EXRAM_WRITE:
-			chipio_8051_write_exram(codec, s->a, s->b);
-			break;
-		default:
-			status = -EINVAL;
-			break;
-		}
-		codec_info(codec, "AE5 strip: arm[%u] op=%u a=%08x b=%08x c=%08x "
-			   "len=%u -> %d\n", i, s->op, s->a, s->b, s->c,
-			   s->len, status);
-		for (j = 0; j < s->len / 4 && j < 8; j++)
-			codec_info(codec, "AE5 strip:   arm[%u] data[%u]=%08x\n",
-				   i, j, s->data[j]);
-	}
-	r = 0;
-}
-
-/* dma14: card-side strip ring read-position (BAR2+0x6104 = Win 0xF43FE104).
- * The Windows driver gates each frame on THIS advancing past the frame — never
- * on a DMA "active" bit (WINDOWS-ANSWERS-2026-09-09 Q2/Q6). Returns UINT_MAX
- * if the mapping is absent. Read-only, fixed offset, no scan. */
-static unsigned int ae5_strip_pos(struct hda_codec *codec)
+static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, int num_leds)
 {
 	struct ca0132_spec *spec = codec->spec;
+	struct snd_dma_buffer dmab;
+	struct hdac_stream *hstr;
+	unsigned int format, stream_tag;
+	u32 enc_words[4];
+	u32 *dst;
+	int total_words = 0x8000 / sizeof(u32); /* 8192 words (32KB) */
+	int word_idx = 0;
+	int frame_words;
+	int led, w;
 
-	if (!spec->pos_base)
-		return UINT_MAX;
-	return readl(spec->pos_base);
+	if (!spec || !spec->mem_base)
+		return -ENODEV;
+	if (num_leds <= 0 || num_leds > AE5_STRIP_MAX_LEDS)
+		return -EINVAL;
+
+	snd_hda_power_up(codec);
+
+	hstr = ae5_strip_find_stream(codec);
+	if (!hstr) {
+		codec_warn(codec, "AE5 strip: no free azx stream\n");
+		snd_hda_power_down(codec);
+		return -EBUSY;
+	}
+
+	/* 44.1kHz, 24-bit, 2-channel format (0x4031) matches Windows CtxHda HDAUDIO_STREAM_FORMAT */
+	format = snd_hdac_stream_format(2, 24, 44100);
+	stream_tag = snd_hdac_dsp_prepare(hstr, format, 0x8000, &dmab);
+	if ((int)stream_tag <= 0) {
+		codec_warn(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d\n", (int)stream_tag);
+		snd_hda_power_down(codec);
+		return -EIO;
+	}
+
+	/* Prevent interrupt storms during free-running LED stream */
+	if (hstr->sd_addr) {
+		u8 sd_ctl = readb(hstr->sd_addr);
+		writeb(sd_ctl & ~0x1c, hstr->sd_addr); /* Clear IOCE, FEIE, DEIE */
+	}
+
+	/* 1. Populate the 32KB DMA buffer with repeating WS2812 frames + reset gaps */
+	memset(dmab.area, 0, 0x8000);
+	dst = (u32 *)dmab.area;
+
+	/* Words per frame: 5 words zero preamble + num_leds * 4 words + 83 words reset gap */
+	frame_words = 5 + (num_leds * 4) + 83;
+
+	while (word_idx + frame_words <= total_words) {
+		/* 5-word zero preamble per Windows CtxHda FUN_00042944 */
+		for (w = 0; w < 5; w++) {
+			*dst++ = 0;
+			word_idx++;
+		}
+		/* LEDs */
+		for (led = 0; led < num_leds; led++) {
+			ae5_strip_encode_24(grb_colors[led], enc_words);
+			for (w = 0; w < 4; w++) {
+				*dst++ = enc_words[w];
+				word_idx++;
+			}
+		}
+		/* 83 words (> 1.8 ms) zero reset gap (WS2812 requires > 50 us low) */
+		for (w = 0; w < 83; w++) {
+			*dst++ = 0;
+			word_idx++;
+		}
+	}
+	while (word_idx < total_words) {
+		*dst++ = 0;
+		word_idx++;
+	}
+	wmb();
+
+	/* 2. Configure CA0113 BAR2 hardware registers */
+	/* Power up clocks (CtxHdb 0x141b7 / 0x14210) */
+	writel(readl(spec->mem_base + 0xc04) | 0x7, spec->mem_base + 0xc04);
+
+	/* Base serializer initialization (CtxHdb 0x14ba4) */
+	writel(readl(spec->mem_base + 0x400) | 1, spec->mem_base + 0x400);
+	writel(readl(spec->mem_base + 0x42c) & ~1, spec->mem_base + 0x42c);
+	writel(readl(spec->mem_base + 0x46c) & ~1, spec->mem_base + 0x46c);
+	writel(readl(spec->mem_base + 0x4ac) & ~1, spec->mem_base + 0x4ac);
+	writel(readl(spec->mem_base + 0x4ec) & ~1, spec->mem_base + 0x4ec);
+	writel(0, spec->mem_base + 0x43c);
+	writel(0, spec->mem_base + 0x47c);
+	writel(0, spec->mem_base + 0x4bc);
+	writel(0, spec->mem_base + 0x4fc);
+	writel(readl(spec->mem_base + 0x408) | 1, spec->mem_base + 0x408);
+	writel(readl(spec->mem_base + 0x40c) | 1, spec->mem_base + 0x40c);
+	writel((readl(spec->mem_base + 0x410) & ~0xb) | 0x14, spec->mem_base + 0x410);
+
+	/* Configure serializers 0..3 clocking (CtxHdb 0x14a6c) */
+	writel(readl(spec->mem_base + 0x43c) | 0x33, spec->mem_base + 0x43c);
+	writel(readl(spec->mem_base + 0x47c) | 0x33, spec->mem_base + 0x47c);
+	writel(readl(spec->mem_base + 0x4bc) | 0x33, spec->mem_base + 0x4bc);
+	writel(readl(spec->mem_base + 0x4fc) | 0x33, spec->mem_base + 0x4fc);
+
+	/* BAR2 + 0x100 format & channel enables:
+	 * - base 0x70f
+	 * - bit 28 = 1 (24-bit audio format via CtxHdb 0x14f58)
+	 * - bits 29..31 = 1 (44.1 kHz sample rate via CtxHdb 0x14fa4)
+	 * - bits 4..7 = 0xf (stage 1 enables)
+	 * - bits 12..15 = 0xf (stage 2 enables)
+	 * => 0x3000ff8f
+	 */
+	writel((readl(spec->mem_base + 0x100) & ~0xe000ffff) | 0x3000ff8f, spec->mem_base + 0x100);
+
+	/* Enable serializer output drivers for pins 0..3 (CtxHdb 0x14e94):
+	 * Channel 0 is 0x454, Channel 1 is 0x494, Channel 2 is 0x4d4, Channel 3 is 0x514
+	 */
+	writel(readl(spec->mem_base + 0x454) | 1, spec->mem_base + 0x454);
+	writel(readl(spec->mem_base + 0x494) | 1, spec->mem_base + 0x494);
+	writel(readl(spec->mem_base + 0x4d4) | 1, spec->mem_base + 0x4d4);
+	writel(readl(spec->mem_base + 0x514) | 1, spec->mem_base + 0x514);
+
+	/* Route all channels 0..3 to stream_tag (CtxHdb 0x1502c) */
+	writel((stream_tag << 28) | (stream_tag << 20) | (stream_tag << 12) | (stream_tag << 4),
+	       spec->mem_base + 0x104);
+
+	/* Enable CA0113 MMIO GPIO 0 & 1 */
+	ca0113_mmio_gpio_set(codec, 0, true);
+	ca0113_mmio_gpio_set(codec, 1, true);
+
+	codec_info(codec, "AE5 strip: send_frame: num_leds=%d stream_tag=%u (0x%08x)\n",
+		   num_leds, stream_tag, readl(spec->mem_base + 0x104));
+
+	/* 3. Trigger stream transmission on HDA link */
+	disable_irq(codec->bus->core.irq);
+	snd_hdac_dsp_trigger(hstr, true);
+	msleep(1000); /* Run for 1.0s: transmits ~700 frames and latches WS2812 */
+	snd_hdac_dsp_trigger(hstr, false);
+	enable_irq(codec->bus->core.irq);
+	codec_info(codec, "AE5 strip: trigger complete\n");
+
+	/* Teardown: clear 0x104 pin mux back to 0 */
+	writel(0x00000000, spec->mem_base + 0x104);
+	snd_hdac_dsp_cleanup(hstr, &dmab);
+	snd_hda_power_down(codec);
+
+	return 0;
 }
 
 static void ae5_strip_write_test(struct hda_codec *codec)
 {
-	struct snd_dma_buffer dmab;
-	struct hdac_stream *hstr;
-	unsigned int port_map_mask, response;
-	unsigned int format, stream_tag;
-	u32 words[8], wgreen[8];
-	unsigned int dsp_addx, dbadr, dma_chan;
-	bool code, yram;
-	int burst, i, status;
-	unsigned int src_conn;
+	u32 red[10];
+	int i;
 
-	codec_info(codec, "AE5 strip: TEST BUILD dma11\n");
-	ae5_strip_encode_24(0x00ff0000, words);
-	ae5_strip_encode_24(0x0000ff00, wgreen);
+	for (i = 0; i < 10; i++)
+		red[i] = 0x00ff00; /* GRB: G=0, R=255, B=0 -> Red */
 
-	/* Find the DSP-loader azx stream for the source ring. */
-	hstr = ae5_strip_find_stream(codec);
-	if (!hstr) {
-		codec_info(codec, "AE5 strip: no free azx stream\n");
-		return;
-	}
-
-	format = snd_hdac_stream_format(6, 32, 96000);
-
-	/* Configure the CHIP_CTRL converter for 6ch/96k. */
-	status = codec_set_converter_format(codec, WIDGET_CHIP_CTRL, format, &response);
-	codec_info(codec, "AE5 strip: converter fmt -> %d res=0x%x\n", status, response);
-	if (status < 0)
-		return;
-
-	/* Set up source ring (azx BDLE) directly, bypassing load_dsp_prepare. */
-	stream_tag = snd_hdac_dsp_prepare(hstr, format, 0x8000, &dmab);
-	if ((int)stream_tag < 0) {
-		codec_info(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d (idx=%u tag=%u)\n",
-			   (int)stream_tag, hstr->index, hstr->stream_tag);
-		return;
-	}
-	codec_info(codec, "AE5 strip: source stream idx=%u tag=%u prepared\n",
-		   hstr->index, hstr->stream_tag);
-	memset(dmab.area, 0, 0x8000);
-	/* Ring discipline: 40B preamble + 10 red LEDs(8w ea@96k) + reset gap,
-	 * repeated across the whole ring so the contiguous drain emits real
-	 * frames with WS2812 reset gaps, mirroring Windows' ring usage. */
-	{
-		u32 *pp = (u32 *)dmab.area;
-		int ndone = 0;
-		while (ndone + 120 <= 0x2000) {
-			pp += 10;               /* 40B preamble (zeros) */
-			for (i = 0; i < 10; i++)
-				memcpy(pp + i * 8, words, sizeof(words));
-			pp += 80;               /* 10 LEDs * 8 words              */
-			pp += 30;               /* reset gap (zeros)              */
-			ndone += 120;
-		}
-	}
-	wmb();
-
-	/* Allocate DSP ports for the stream -> real port_map_mask (AUDCHSEL). */
-	status = dsp_allocate_ports_format(codec, format, &port_map_mask);
-	codec_info(codec, "AE5 strip: alloc ports -> %d mask=0x%x\n", status, port_map_mask);
-	if (status < 0) {
-		snd_hdac_dsp_cleanup(hstr, &dmab);
-		return;
-	}
-
-	/* Bind the azx stream to the converter. */
-	status = codec_set_converter_stream_channel(codec, WIDGET_CHIP_CTRL,
-						   stream_tag, 0, &response);
-	codec_info(codec, "AE5 strip: bind stream -> %d res=0x%x\n", status, response);
-	if (status < 0)
-		goto out_free_ports;
-
-	/* Candidate 2 (cheapest falsification): bind THIS azx tag to DSP stream
-	 * 0x18 directly by setting hda_streamid + format in its exram row, so
-	 * the DSP knows stream 0x18 consumes from azx tag %u. Row base 0x72f,
-	 * stride 0x0a; offset7 = streamid, offset8/9 = format (LE). Commit with
-	 * the same 0xfa92=0x22 token ae5_post_dsp_stream_setup uses. */
-	{
-		u8 row[10];
-		unsigned int data;
-		int j;
-
-		for (j = 0; j < 10; j++) {
-			chipio_8051_read_exram(codec, 0x81f + j, &data);
-			row[j] = data & 0xff;
-		}
-		codec_info(codec, "AE5 strip: stream0x18 pre  %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-			   row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9]);
-		row[7] = hstr->stream_tag;
-		row[8] = format & 0xff;
-		row[9] = (format >> 8) & 0xff;
-		for (j = 0; j < 10; j++)
-			chipio_8051_write_exram(codec, 0x81f + j, row[j]);
-		chipio_8051_write_exram(codec, 0xfa92, 0x22);
-		for (j = 0; j < 10; j++) {
-			chipio_8051_read_exram(codec, 0x81f + j, &data);
-			row[j] = data & 0xff;
-		}
-		codec_info(codec, "AE5 strip: stream0x18 post %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x (tag=%u fmt=0x%x)\n",
-			   row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9],
-			   hstr->stream_tag, format);
-	}
-
-	/* dma11: route this run's azx DSP input connector block INTO stream 0x18
-	 * so the ASI engine's source point finally has a feeder. Official SCP
-	 * stream-source/dest verbs. Source = start of THIS run's allocated port
-	 * block (port_map_mask bits 8..19 -> connectors 0xc0..0xcb, so
-	 * src = 0xc0 + (first_set_bit - 9)).
-	 *
-	 * Accepted verdict (predefined, no live improvising):
-	 *  - row source byte or PARAM_GET source == derived src -> ACCEPT -> drain
-	 *  - accepts but neither reflects src after 3 tries -> ROUTING NOT TAKEN
-	 *    -> ABORT drain; next step = static RE of FUN_0001a454.
-	 *  - chipio verb/read hangs or faults -> WEDGED (dmesg visible).
-	 * Note: chipio_set_stream_source_dest is void, so a verb-return "call
-	 * failed" is not observable; this dual readback is the failure detector.
-	 */
-	{
-		unsigned int src_off = __ffs(port_map_mask);
-		unsigned int src_read = 0, src_get = 0;
-		unsigned int tr;
-		int tries;
-
-		src_conn = 0xc0 + (src_off - 8);
-		for (tries = 0; tries < 3; tries++) {
-			chipio_set_stream_source_dest(codec, 0x18, src_conn, 0xd0);
-			if (tries > 0)
-				chipio_8051_write_exram(codec, 0xfa92, 0x22);
-			chipio_8051_read_exram(codec, 0x81f + 1, &src_read);
-			src_get = snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
-						  VENDOR_CHIPIO_PARAM_GET,
-						  CONTROL_PARAM_STREAM_SOURCE_CONN_POINT);
-			codec_info(codec, "AE5 strip: route0x18 mask=0x%x ffs=%u src=0x%02x "
-				   "(row=0x%02x param=0x%02x, try %d)\n",
-				   port_map_mask, src_off, src_conn,
-				   src_read & 0xff, src_get & 0xff, tries);
-			if ((src_read & 0xff) == src_conn ||
-			    (src_get & 0xff) == src_conn)
-				break;
-		}
-		if ((src_read & 0xff) != src_conn && (src_get & 0xff) != src_conn) {
-			codec_info(codec, "AE5 strip: ROUTING NOT TAKEN after %d tries "
-				   "(row=0x%02x param=0x%02x) -> ABORT drain; next: FUN_0001a454 RE\n",
-				   tries, src_read & 0xff, src_get & 0xff);
-			goto out_free_ports;
-		}
-		codec_info(codec, "AE5 strip: ROUTING ACCEPTED (stream0x18 source=0x%02x -> "
-			   "0xd0); drain ON, watch audio-path lanes + strip\n", src_conn);
-		for (tr = 0; tr < 12; tr++) {
-			unsigned int v;
-
-			chipio_read(codec, 0x190080 + tr * 4, &v);
-			codec_info(codec, "AE5 strip:   post-route lane %d = 0x%08x\n", tr, v);
-		}
-	}
-
-	/* dma13: run the captured ARM sequence (ring base/size/arm) if present.
-	 * The c4 route engages but the DMAC never fetches (CCNT frozen) until the
-	 * strip DMA engine is told our ring base - this injects the exact Windows
-	 * bytes once the Windows side live-captures them (empty until then). */
-	ae5_strip_run_arm(codec);
-
-	/* Start the azx source stream ON before arming DSP DMA, so the DSP
-	 * DMAC actually reads real ring data (dma5/dma6 never triggered the
-	 * HDA stream -> drains "completed" on idle data). */
-	snd_hdac_dsp_trigger(hstr, true);
-
-	status = dspio_alloc_dma_chan(codec, &dma_chan);
-	if (status < 0) {
-		codec_info(codec, "AE5 strip: alloc_dma_chan failed %d\n", status);
-		goto out_trigger_off;
-	}
-
-	dsp_addx = dsp_chip_to_dsp_addx(0x190080, &code, &yram);
-	if (dsp_addx == INVALID_CHIP_ADDRESS) {
-		codec_info(codec, "AE5 strip: 0x190080 invalid for DSP DMA\n");
-		goto out_free_chan;
-	}
-	dbadr = dsp_addx << DSPDMAC_DMACFG_DBADR_LOBIT;
-	if (!code) {
-		dbadr <<= 1;
-		if (yram)
-			dbadr |= (1 << DSPDMAC_DMACFG_DBADR_LOBIT);
-	}
-	if (dbadr != 0x40) {
-		codec_info(codec, "AE5 strip: aborting DMA (DBADR=0x%x != 0x40)\n", dbadr);
-		goto out_free_chan;
-	}
-
-	/* dma17: Windows-exact RING GEOMETRY (no invented descriptor bytes). Per the
-	 * 2026-09-14 Windows static RE (CAPTURE-REQ-ANSWER.md): the ring base
-	 * carries a host-RAM descriptor the DSP DMAC reads; Windows writes frames
-	 * at (pos + 0xA8) % 0x8000, never touching ring[0..0xA7] (header zone),
-	 * then zero-fills. Our prior runs clobbered the header zone by filling
-	 * from offset 0. Mirror geometry exactly here: header zone stays zero,
-	 * one frame at 0xA8, zero-fill tail. Descriptor bytes themselves are the
-	 * sole missing item (pending Windows ring[0..0x3F] dump). */
-	codec_info(codec, "AE5 strip: dma17 windows-geometry model ON "
-			   "(frame@0xA8, header zone reserved, zero-fill)\n");
-	{
-		unsigned int v2c;
-		u32 *fh;
-		u32 cwpat[8];
-
-		for (burst = 0; burst < 2; burst++) {
-			/* frame content: 40B zero preamble + 10 LEDs (96k: 10*80 *8B words) */
-			memcpy(cwpat, burst % 2 ? wgreen : words, sizeof(cwpat));
-			memset(dmab.area, 0, 0x8000);
-			fh = (u32 *)(dmab.area + 0xA8);
-			for (i = 0; i < 10; i++)
-				memcpy(fh + i * 8, cwpat, sizeof(cwpat));
-			wmb();
-
-			codec_info(codec, "AE5 strip:   [%d] frame@0xA8 (10 LEDs, %s), waiting 2s\n",
-				   burst, burst % 2 ? "green" : "red");
-			msleep(2000);
-			chipio_read(codec, 0x1900b0, &v2c);
-			codec_info(codec, "AE5 strip:   [%d] done 0x2c=%08x (pos unreadable on "
-				   "this host: BARs 16K)\n", burst, v2c);
-
-			/* Windows commit step: zero-fill tail (reset/off gap). */
-			memset(dmab.area, 0, 0x8000);
-			wmb();
-			msleep(400);
-		}
-		codec_info(codec, "AE5 strip: dma17 pass complete (chan=%u); "
-			   "descriptor bytes still pending Windows dump\n",
-			   dma_chan);
-	}
-	codec_info(codec, "AE5 strip: pure-azx+pos drain OFF\n");
-
-out_free_chan:
-	dspio_free_dma_chan(codec, dma_chan);
-out_trigger_off:
-	snd_hdac_dsp_trigger(hstr, false);
-
-	/* Reset converter stream binding and free DSP ports. */
-	codec_set_converter_stream_channel(codec, WIDGET_CHIP_CTRL, 0, 0, &response);
-out_free_ports:
-	dsp_free_ports(codec);
-	snd_hdac_dsp_cleanup(hstr, &dmab);
+	codec_info(codec, "AE5 strip: running test frame (10 Red LEDs)\n");
+	ae5_strip_send_frame(codec, red, 10);
 }
 
 static ssize_t ae5_strip_test_store(struct device *dev,
-			struct device_attribute *attr, const char *buf, size_t count)
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
 	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
 	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
@@ -8735,88 +8531,115 @@ static ssize_t ae5_strip_test_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(ae5_strip_test);
 
-/* dma15: 8051-exram baseline sweeper. Safe spy (fixed range, no BAR2 scan).
- * chipio_8051_read_exram() reads any 8051-exram byte (DATA_READ 0x708).
- * Goal: confirm the 0xfa92=0x22 commit token persists (validates the spy) and
- * fingerprint the descriptor-constants region around it so a future bake can be
- * verified by diff. Logs nonzero bytes; always logs the token row. */
-static void ae5_strip_probe_exram(struct hda_codec *codec)
+static ssize_t ae5_strip_leds_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
-	struct ca0132_spec *spec = codec->spec;
-	const u16 ranges[] = { 0xfa00, 0xfb00 };
-	const u16 data_lo = 0x0000;
-	u32 v;
-	int r, i, nz;
+	int i, len = 0;
 
-	if (!spec)
-		return;
-	snd_hda_power_up(codec);
-	/* dma16: full pre-bake baseline of the 8051 XRAM data plane
-	 * (0x0000-0x7fff; 0xe000+ is program space, swept above as code).
-	 * Block-summarized to bound output: print nonzero rows only for sparse
-	 * blocks (nz<64), else a one-line dense-block count. */
-	for (r = 0; r < 0x80; r++) {
-		u16 base = data_lo + (r << 8);
-		int dense = 0;
-
-		guard(mutex)(&spec->chipio_mutex);
-		nz = 0;
-		for (i = 0; i < 0x100; i++) {
-			u16 addr = base + i;
-
-			chipio_8051_read_exram(codec, addr, &v);
-			if (v)
-				nz++;
-			if (nz == 64)
-				dense = 1;
-		}
-		if (dense) {
-			codec_info(codec, "AE5 exram: block %04x-%04x dense (%d nz)\n",
-				   base, base + 0xff, nz);
-			continue;
-		}
-		for (i = 0; i < 0x100; i++) {
-			u16 addr = base + i;
-
-			chipio_8051_read_exram(codec, addr, &v);
-			if (v)
-				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
-					   addr, v);
-		}
+	for (i = 0; i < ae5_strip_cur_num_leds && len < PAGE_SIZE - 16; i++) {
+		u32 grb = ae5_strip_cur_colors[i];
+		u8 g = (grb >> 16) & 0xff;
+		u8 r = (grb >> 8) & 0xff;
+		u8 b = grb & 0xff;
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s#%02x%02x%02x",
+				 i == 0 ? "" : ",", r, g, b);
 	}
-	for (r = 0; r < 2; r++) {
-		nz = 0;
-		guard(mutex)(&spec->chipio_mutex);
-		for (i = 0; i < 0x100; i++) {
-			u16 addr = ranges[r] + i;
-
-			chipio_8051_read_exram(codec, addr, &v);
-			if (v == 0 && addr != 0xfa92)
-				continue;
-			if (addr >= 0xfa80 && addr <= 0xfabf)
-				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
-					   addr, v);
-			else if (v)
-				codec_info(codec, "AE5 exram: [%04x]=%02x\n",
-					   addr, v);
-			nz++;
-		}
-		codec_info(codec, "AE5 exram: sweep %04x-%04x nonzero=%d\n",
-			   ranges[r], ranges[r] + 0xff, nz);
-	}
-	snd_hda_power_down(codec);
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	return len;
 }
 
-static ssize_t ae5_strip_probe_store(struct device *dev,
-			struct device_attribute *attr, const char *buf,
-			size_t count)
+static ssize_t ae5_strip_leds_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
 	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
 	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
-	ae5_strip_probe_exram(codec);
+	u32 colors[AE5_STRIP_MAX_LEDS];
+	int num_leds = 0;
+	const char *p = buf;
+	int err;
+
+	codec_info(codec, "AE5 strip: leds_store received %zu bytes: '%.*s'\n",
+		   count, (int)min_t(size_t, count, 64), buf);
+
+	while (*p && *p != '\n' && num_leds < AE5_STRIP_MAX_LEDS) {
+		unsigned int r = 0, g = 0, b = 0;
+		while (*p == ' ' || *p == ',' || *p == '\t')
+			p++;
+		if (!*p || *p == '\n')
+			break;
+		if (*p == '#')
+			p++;
+		if (sscanf(p, "%02x%02x%02x", &r, &g, &b) == 3) {
+			colors[num_leds++] = ((g & 0xff) << 16) | ((r & 0xff) << 8) | (b & 0xff);
+			p += 6;
+		} else if (sscanf(p, "%u,%u,%u", &r, &g, &b) == 3) {
+			colors[num_leds++] = ((g & 0xff) << 16) | ((r & 0xff) << 8) | (b & 0xff);
+			while (*p && *p != ',' && *p != ' ' && *p != '\n')
+				p++;
+			while (*p == ',' || *p == ' ')
+				p++;
+			while (*p && *p != ',' && *p != ' ' && *p != '\n')
+				p++;
+			while (*p == ',' || *p == ' ')
+				p++;
+			while (*p && *p != ',' && *p != ' ' && *p != '\n')
+				p++;
+		} else {
+			break;
+		}
+	}
+
+	if (num_leds == 0)
+		return -EINVAL;
+
+	/* If 1 color is supplied, replicate it across all configured LEDs */
+	if (num_leds == 1) {
+		int i;
+		for (i = 1; i < ae5_strip_cur_num_leds; i++)
+			colors[i] = colors[0];
+		num_leds = ae5_strip_cur_num_leds;
+	} else if (num_leds < ae5_strip_cur_num_leds) {
+		/* Partial update: keep existing colors for downstream LEDs and send full frame */
+		int i;
+		for (i = num_leds; i < ae5_strip_cur_num_leds; i++)
+			colors[i] = ae5_strip_cur_colors[i];
+		num_leds = ae5_strip_cur_num_leds;
+	} else {
+		/* More colors supplied: expand strip count */
+		ae5_strip_cur_num_leds = num_leds;
+	}
+
+	memcpy(ae5_strip_cur_colors, colors, sizeof(u32) * num_leds);
+
+	err = ae5_strip_send_frame(codec, colors, num_leds);
+	if (err < 0)
+		return err;
+
 	return count;
 }
-static DEVICE_ATTR_WO(ae5_strip_probe);
+static DEVICE_ATTR_RW(ae5_strip_leds);
+
+static ssize_t ae5_strip_num_leds_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", ae5_strip_cur_num_leds);
+}
+
+static ssize_t ae5_strip_num_leds_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
+	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	unsigned int n;
+	if (kstrtouint(buf, 0, &n) || n == 0 || n > AE5_STRIP_MAX_LEDS)
+		return -EINVAL;
+	ae5_strip_cur_num_leds = n;
+	ae5_strip_send_frame(codec, ae5_strip_cur_colors, n);
+	return count;
+}
+static DEVICE_ATTR_RW(ae5_strip_num_leds);
 
 static void ae5_setup_defaults(struct hda_codec *codec)
 {
@@ -8864,7 +8687,6 @@ static void ae5_setup_defaults(struct hda_codec *codec)
 	ae5_post_dsp_param_setup(codec);
 	ae5_post_dsp_pll_setup(codec);
 	ae5_post_dsp_stream_setup(codec);
-	ae5_strip_probe_port(codec);
 	ae5_post_dsp_startup_data(codec);
 
 	/* out, in effects + voicefx */
@@ -10080,12 +9902,16 @@ static int ca0132_init(struct hda_codec *codec)
 	}
 
 	if (ca0132_quirk(spec) == QUIRK_AE5) {
-		int err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_test);
+		int err;
+		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_leds);
+		if (err)
+			codec_warn(codec, "AE5 strip: create leds sysfs failed %d\n", err);
+		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_num_leds);
+		if (err)
+			codec_warn(codec, "AE5 strip: create num_leds sysfs failed %d\n", err);
+		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_test);
 		if (err)
 			codec_warn(codec, "AE5 strip: create test sysfs failed %d\n", err);
-		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_probe);
-		if (err)
-			codec_warn(codec, "AE5 strip: create probe sysfs failed %d\n", err);
 	}
 
 	return 0;
@@ -10140,10 +9966,6 @@ static void ca0132_free(struct hda_codec *codec)
 
 	snd_hda_power_down(codec);
 #ifdef CONFIG_PCI
-	if (spec->pos_base) {
-		pci_iounmap(codec->bus->pci, spec->pos_base);
-		spec->pos_base = NULL;
-	}
 	if (spec->mem_base)
 		pci_iounmap(codec->bus->pci, spec->mem_base);
 #endif
@@ -10436,8 +10258,9 @@ static void ca0132_codec_remove(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_leds);
+	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_num_leds);
 	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_test);
-	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_probe);
 	if (ca0132_quirk(spec) == QUIRK_ZXR_DBPRO)
 		return dbpro_free(codec);
 	else
@@ -10532,12 +10355,6 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		if (spec->mem_base == NULL) {
 			codec_warn(codec, "pci_iomap failed! Setting quirk to QUIRK_NONE.");
 			codec->fixup_id = QUIRK_NONE;
-		} else {
-			/* dma14: single fixed read-only mapping of the strip
-			 * ring position register (BAR2+0x6104, = Win 0xF43FE104).
-			 * Read-only, no scan (scanning BAR2 crashes both OSes). */
-			spec->pos_base = pci_iomap_range(codec->bus->pci, 2,
-							  0x6104, 4);
 		}
 	}
 #endif
@@ -10634,3 +10451,4 @@ static struct hda_codec_driver ca0132_driver = {
 };
 
 module_hda_codec_driver(ca0132_driver);
+
