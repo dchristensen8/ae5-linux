@@ -17,3 +17,15 @@ modules.order
 *.sr
 *.logicdata
 __pycache__/
+*.wav
+t
+t[0-9]*
+ae5_gpio*
+hdaverb
+lpub_probe
+windriver/
+windows-capture/
+ghidra/
+fw-analysis/
+ksrc/
+ca0132-tools/
