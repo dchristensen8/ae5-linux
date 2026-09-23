@@ -1899,3 +1899,81 @@ requested: B=FF
 - Fully confirms complete symmetry and nanosecond timing compliance across all bits and boundaries.
 
 
+
+## OPENRGB INTEGRATION (2026-09-22) — external strip controllable from OpenRGB
+
+Integrated the AE-5 external WS2812 strip into OpenRGB (in `/home/christensen/openrgb-src`,
+the AE-5-patched tree). The existing Linux controller drove only the 5 on-card APA102 LEDs via
+BAR2 GPIO; the external "Addressable RGB Header" zone was a no-op ("not controllable on Linux").
+
+**Changes (3 files):**
+- `CreativeSoundBlasterAE5Controller_Linux.cpp/h`: added `FindStripSysfsPath()` (scans
+  `/sys/bus/hdaudio/devices/*` for `ae5_strip_leds`) and `WriteExternalStrip()` (builds
+  `#RRGGBB,...` payload from the trailing LEDs beyond the 5 internal, writes to the kernel
+  sysfs). `SetLEDColors` now writes the external strip instead of ignoring it.
+- `RGBController_CreativeSoundBlasterAE5.cpp`: (1) sync the controller's `external_led_count`
+  from the zone in `SetupZones` (so CLI/first-run passes the full LED array); (2) fix LED naming
+  to use the per-zone name (was hardcoded to zones[0] = "Internal").
+
+**Verified end-to-end (kernel log + sysfs):**
+- `./openrgb --device 7 --color FF0000` -> sysfs `ae5_strip_leds` = `#ff0000 ×10`, kernel logs
+  `leds_store received ... send_frame num_leds=10 stream_tag=5 ... trigger complete`.
+- Multi-color `--color "FF0000,00FF00,0000FF,..."` -> distinct per-LED colors written.
+- Works both standalone and through the systemd root server (`openrgb-server.service` ->
+  `/opt/openrgb-ae5/openrgb`, rebuilt with the new code).
+- Internal on-card LEDs unaffected.
+
+**Notes:**
+- The sysfs attrs are root-owned (`rw-r--r--`), so OpenRGB must run as root (already required for
+  the on-card `/dev/mem` path) — no udev rule needed for the existing root-server setup.
+- `--zone 1 --size N` alone errors ("neither mode nor color given" CLI quirk), but a persisted
+  zone size works; color writes apply directly.
+- Binary: `/opt/openrgb-ae5/openrgb` (rebuilt; old binary saved as `openrgb.old`). Changes are
+  uncommitted in the openrgb-src git tree.
+
+### FIX: rapid color updates (2026-09-22) — AE-5 lagged on quick theme/effect changes
+
+**Symptom:** changing colors faster than ~1-2s left the AE-5 stuck on the old color while the
+rest of the LEDs updated (OpenRGB effects/theme changes dropped AE-5 updates).
+
+**Root cause:** `ae5_strip_send_frame()` in ca0132.c had `msleep(1000)` after the HDA stream
+trigger — every `ae5_strip_leds` sysfs write BLOCKED ~1s. The store handler is synchronous, so
+rapid writes serialized behind the 1s sleep and got dropped/lagged.
+
+**Fix:** reduced `msleep(1000)` → `msleep(15)`. WS2812 latches on the >50us reset gap after one
+frame; the 32KB buffer holds ~64 repeating frame+reset cycles (~1.4ms/frame), so a 15ms run
+transmits ~10 complete cycles — more than enough to latch reliably. Each write now ~16ms.
+
+**Verified:** 6 rapid direct sysfs writes each ~16ms, all applied, final color correct. 4 rapid
+OpenRGB writes (FF0000→00FF00→0000FF→00FFFF) all applied, final #00ffff on strip. Rebuilt
+`snd-hda-codec-ca0132-prod.ko`, reloaded.
+
+### FIX: occasional lag under rapid updates (2026-09-22) — retry on azx-stream contention
+
+After the msleep fix, occasional lag remained. Root cause: `ae5_strip_find_stream()` returns
+NULL (write drops with -EBUSY) when active audio playback transiently holds all azx streams.
+Added a retry loop (up to ~100ms, 5ms steps) in `ae5_strip_send_frame()` before giving up.
+
+Verified: 30 rapid writes avg 16ms, max 41ms — no drop/lag spikes. Rebuilt + reloaded
+`snd-hda-codec-ca0132-prod.ko`.
+
+NOTE: this helps transient contention. If audio holds ALL streams persistently, the write still
+gives up after ~100ms. A fully robust fix (reserve/hold one azx stream for the strip at init so
+audio never steals it) is possible but touches the teardown path (crash history) — deferred.
+
+### FIX: AE-5 doesn't turn off with OpenRGB global off (2026-09-22)
+
+**Symptom:** turning all lights off in OpenRGB left the AE-5 lit (strip stayed at its last color).
+
+**Root cause:** OpenRGB's global off sets the AE-5 to the "Off" mode (AE5_MODE_OFF,
+MODE_COLORS_NONE). `DeviceUpdateMode()`'s default case only filled colors with black for STATIC
+mode; for OFF it called DeviceUpdateLEDs() with the LAST (non-black) colors, so the strip kept
+its previous color.
+
+**Fix:** in RGBController_CreativeSoundBlasterAE5::DeviceUpdateMode(), the OFF case now
+explicitly sets every LED to 0x000000 before DeviceUpdateLEDs(), so both the external strip
+(sysfs) and on-card LEDs are driven black.
+
+**Verified:** set RED -> mode Off -> sysfs shows #000000 (strip off). Direct/color mode still
+sets colors normally. Rebuilt + reinstalled /opt/openrgb-ae5/openrgb, restarted
+openrgb-server.service.

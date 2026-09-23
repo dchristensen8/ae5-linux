@@ -8386,9 +8386,20 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 
 	hstr = ae5_strip_find_stream(codec);
 	if (!hstr) {
-		codec_warn(codec, "AE5 strip: no free azx stream\n");
-		snd_hda_power_down(codec);
-		return -EBUSY;
+		/* Audio may transiently hold all azx streams; retry for a short window so a
+		 * rapid LED update isn't dropped/lagged behind active playback. */
+		int retries = 20; /* ~100ms max */
+
+		do {
+			msleep(5);
+			hstr = ae5_strip_find_stream(codec);
+		} while (!hstr && --retries > 0);
+
+		if (!hstr) {
+			codec_warn(codec, "AE5 strip: no free azx stream after retries\n");
+			snd_hda_power_down(codec);
+			return -EBUSY;
+		}
 	}
 
 	/* 44.1kHz, 24-bit, 2-channel format (0x4031) matches Windows CtxHda HDAUDIO_STREAM_FORMAT */
@@ -8489,16 +8500,20 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 	ca0113_mmio_gpio_set(codec, 0, true);
 	ca0113_mmio_gpio_set(codec, 1, true);
 
-	codec_info(codec, "AE5 strip: send_frame: num_leds=%d stream_tag=%u (0x%08x)\n",
+	codec_dbg(codec, "AE5 strip: send_frame: num_leds=%d stream_tag=%u (0x%08x)\n",
 		   num_leds, stream_tag, readl(spec->mem_base + 0x104));
 
 	/* 3. Trigger stream transmission on HDA link */
 	disable_irq(codec->bus->core.irq);
 	snd_hdac_dsp_trigger(hstr, true);
-	msleep(1000); /* Run for 1.0s: transmits ~700 frames and latches WS2812 */
+	/* WS2812 latches on the >50us reset gap after one frame. The 32KB buffer holds ~64
+	 * repeating frame+reset cycles; at ~1.4ms/frame a 15ms run transmits ~10 complete
+	 * cycles — more than enough to latch reliably. Keep it short so rapid sysfs writes
+	 * (OpenRGB effects/theme changes) are not serialized behind a 1s blocking sleep. */
+	msleep(15);
 	snd_hdac_dsp_trigger(hstr, false);
 	enable_irq(codec->bus->core.irq);
-	codec_info(codec, "AE5 strip: trigger complete\n");
+	codec_dbg(codec, "AE5 strip: trigger complete\n");
 
 	/* Teardown: clear 0x104 pin mux back to 0 */
 	writel(0x00000000, spec->mem_base + 0x104);
@@ -8559,8 +8574,8 @@ static ssize_t ae5_strip_leds_store(struct device *dev,
 	const char *p = buf;
 	int err;
 
-	codec_info(codec, "AE5 strip: leds_store received %zu bytes: '%.*s'\n",
-		   count, (int)min_t(size_t, count, 64), buf);
+	codec_dbg(codec, "AE5 strip: leds_store received %zu bytes: '%.*s'\n",
+		  count, (int)min_t(size_t, count, 64), buf);
 
 	while (*p && *p != '\n' && num_leds < AE5_STRIP_MAX_LEDS) {
 		unsigned int r = 0, g = 0, b = 0;
