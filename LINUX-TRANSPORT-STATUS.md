@@ -1977,3 +1977,27 @@ explicitly sets every LED to 0x000000 before DeviceUpdateLEDs(), so both the ext
 **Verified:** set RED -> mode Off -> sysfs shows #000000 (strip off). Direct/color mode still
 sets colors normally. Rebuilt + reinstalled /opt/openrgb-ae5/openrgb, restarted
 openrgb-server.service.
+
+### FIX: random misfires on zone/selection updates (2026-09-22) — OpenRGB zone-relative buffer bug
+
+**Symptom:** random misfires — external strip didn't follow the color selection, not tied to
+update speed (kernel always succeeded: 309/309 triggers).
+
+**Root cause (OpenRGB controller):** `DeviceUpdateZoneLEDs(zone)`/`DeviceUpdateSingleLED()`
+called `UpdateLEDRange(start_led, zone_count)` which builds a ZONE-RELATIVE color buffer (e.g.
+external zone = indices 0-9). `WriteExternalStrip()` assumed the buffer started with 5 internal
+LEDs and split at index 5 — so on a direct external-zone update it read buffer[5..9] (wrong LEDs)
+and wrote only 5. Result: misfire whenever the external zone was updated in isolation.
+
+**Fix:** `DeviceUpdateZoneLEDs()` and `DeviceUpdateSingleLED()` now both call `DeviceUpdateLEDs()`
+(full array), so `SetLEDColors` always receives the full internal+external buffer and
+`WriteExternalStrip` reliably splits at index 5. The AE-5 sends a full frame anyway.
+
+**Verified:** full-device RED (#ff0000 x10); external zone 1 -> BLUE (#0000ff x10, previously
+misfired); recovery RED. Rebuilt, installed to /opt/openrgb-ae5/openrgb, server restarted.
+
+**Also (GUI-permission work, partially complete):** udev rule
+/etc/udev/rules.d/90-ae5-openrgb.rules created + applied (ae5_strip_leds now world-writable,
+resource2 chowned to christensen) so OpenRGB can run as the desktop user on Wayland. The root GUI
+can't attach to Wayland; a user GUI with these perms is the path. Server (headless, root) is
+running the new binary.
