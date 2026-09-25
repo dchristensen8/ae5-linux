@@ -34,9 +34,7 @@
 #include <sound/tlv.h>
 #endif
 
-#include <linux/ktime.h>
 #include <linux/dma-mapping.h>
-#include <linux/interrupt.h>
 
 #define FLOAT_ZERO	0x00000000
 #define FLOAT_ONE	0x3f800000
@@ -1063,6 +1061,8 @@ enum dsp_download_state {
  * CA0132 specific
  */
 
+#define AE5_STRIP_MAX_LEDS 100
+
 struct ca0132_spec {
 	const struct snd_kcontrol_new *mixers[5];
 	unsigned int num_mixers;
@@ -1163,6 +1163,11 @@ struct ca0132_spec {
 	 * Renames PlayEnhancement and CrystalVoice too.
 	 */
 	bool use_alt_controls;
+
+	/* AE-5 WS2812 strip control */
+	struct mutex ae5_strip_mutex;
+	u32 ae5_strip_cur_colors[AE5_STRIP_MAX_LEDS];
+	int ae5_strip_cur_num_leds;
 };
 
 /*
@@ -2568,14 +2573,6 @@ static unsigned int dsp_chip_to_dsp_addx(unsigned int chip_addx,
 	} else if (Y_RANGE_ALL(chip_addx, 1)) {
 		*yram = true;
 		return Y_OFF(chip_addx);
-	} else if (chip_addx >= 0x190000 && chip_addx < 0x1A0000) {
-		/*
-		 * Port/stream window region (0x190000+). DBADR = word offset
-		 * from the region base, like the data banks. code=false,
-		 * yram=false ("data-like"). Experimental: the firmware path
-		 * never needed this region; used for the AE-5 LED stream 0x18.
-		 */
-		return (chip_addx - 0x190000) / 4;
 	}
 
 	return INVALID_CHIP_ADDRESS;
@@ -7900,17 +7897,13 @@ static void ae5_post_dsp_register_set(struct hda_codec *codec)
 	writeb(0xff, spec->mem_base + 0x304);
 	writeb(0xff, spec->mem_base + 0x304);
 	writeb(0xff, spec->mem_base + 0x304);
-	if (spec->mem_base)
-		writel(0x0000070f, spec->mem_base + 0x100);
+	writeb(0x00, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	if (spec->mem_base)
-		writel(0x0000070f, spec->mem_base + 0x100);
+	writeb(0x00, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	if (spec->mem_base)
-		writel(0x0000070f, spec->mem_base + 0x100);
+	writeb(0x00, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	if (spec->mem_base)
-		writel(0x0000070f, spec->mem_base + 0x100);
+	writeb(0x00, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
 
 	ca0113_mmio_command_set(codec, 0x30, 0x2b, 0x3f);
@@ -7960,11 +7953,11 @@ static void ae5_post_dsp_stream_setup(struct hda_codec *codec)
 	chipio_set_stream_source_dest(codec, 0x5, 0x43, 0x0);
 
 	chipio_set_stream_source_dest(codec, 0x18, 0x9, 0xd0);
-	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_44_100);
-	chipio_set_stream_channels(codec, 0x18, 2);
+	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_96_000);
+	chipio_set_stream_channels(codec, 0x18, 6);
 	chipio_set_stream_control(codec, 0x18, 1);
 
-	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 7);
+	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 4);
 
 	chipio_8051_write_pll_pmu_no_mutex(codec, 0x43, 0xc7);
 
@@ -8344,7 +8337,9 @@ static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 	struct hdac_bus *bus = &codec->bus->core;
 	struct hdac_stream *s, *dsp = NULL, *z0 = NULL, *first = NULL;
+	unsigned long flags;
 
+	spin_lock_irqsave(&bus->reg_lock, flags);
 	list_for_each_entry(s, &bus->stream_list, list) {
 		if (s->running || s->locked)
 			continue;
@@ -8356,19 +8351,19 @@ static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
 		if (s->index == 0)
 			z0 = s;
 	}
+	spin_unlock_irqrestore(&bus->reg_lock, flags);
+
 	return dsp ? dsp : (z0 ? z0 : first);
 }
 
-#define AE5_STRIP_MAX_LEDS 100
-
-static u32 ae5_strip_cur_colors[AE5_STRIP_MAX_LEDS];
-static int ae5_strip_cur_num_leds = 10;
-
+/*
+ * Caller must hold spec->ae5_strip_mutex.
+ */
 static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, int num_leds)
 {
 	struct ca0132_spec *spec = codec->spec;
 	struct snd_dma_buffer dmab;
-	struct hdac_stream *hstr;
+	struct hdac_stream *hstr = NULL;
 	unsigned int format, stream_tag;
 	u32 enc_words[4];
 	u32 *dst;
@@ -8376,6 +8371,8 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 	int word_idx = 0;
 	int frame_words;
 	int led, w;
+	int retries = 20; /* ~100ms max */
+	u8 orig_sd_ctl = 0;
 
 	if (!spec || !spec->mem_base)
 		return -ENODEV;
@@ -8384,37 +8381,38 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 
 	snd_hda_power_up(codec);
 
-	hstr = ae5_strip_find_stream(codec);
-	if (!hstr) {
-		/* Audio may transiently hold all azx streams; retry for a short window so a
-		 * rapid LED update isn't dropped/lagged behind active playback. */
-		int retries = 20; /* ~100ms max */
-
-		do {
-			msleep(5);
-			hstr = ae5_strip_find_stream(codec);
-		} while (!hstr && --retries > 0);
-
-		if (!hstr) {
-			codec_warn(codec, "AE5 strip: no free azx stream after retries\n");
-			snd_hda_power_down(codec);
-			return -EBUSY;
-		}
-	}
-
 	/* 44.1kHz, 24-bit, 2-channel format (0x4031) matches Windows CtxHda HDAUDIO_STREAM_FORMAT */
 	format = snd_hdac_stream_format(2, 24, 44100);
-	stream_tag = snd_hdac_dsp_prepare(hstr, format, 0x8000, &dmab);
-	if ((int)stream_tag <= 0) {
-		codec_warn(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d\n", (int)stream_tag);
-		snd_hda_power_down(codec);
-		return -EIO;
+
+	for (;;) {
+		hstr = ae5_strip_find_stream(codec);
+		if (!hstr) {
+			if (--retries <= 0) {
+				codec_warn(codec, "AE5 strip: no free azx stream after retries\n");
+				snd_hda_power_down(codec);
+				return -EBUSY;
+			}
+			msleep(5);
+			continue;
+		}
+
+		stream_tag = snd_hdac_dsp_prepare(hstr, format, 0x8000, &dmab);
+		if ((int)stream_tag > 0)
+			break;
+
+		/* Prepare failed (e.g. -EBUSY due to race with playback starting); retry */
+		if (--retries <= 0) {
+			codec_warn(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d\n", (int)stream_tag);
+			snd_hda_power_down(codec);
+			return (int)stream_tag;
+		}
+		msleep(5);
 	}
 
-	/* Prevent interrupt storms during free-running LED stream */
+	/* Prevent interrupt storms during free-running LED stream, saving original control bits */
 	if (hstr->sd_addr) {
-		u8 sd_ctl = readb(hstr->sd_addr);
-		writeb(sd_ctl & ~0x1c, hstr->sd_addr); /* Clear IOCE, FEIE, DEIE */
+		orig_sd_ctl = readb(hstr->sd_addr);
+		writeb(orig_sd_ctl & ~0x1c, hstr->sd_addr); /* Clear IOCE, FEIE, DEIE */
 	}
 
 	/* 1. Populate the 32KB DMA buffer with repeating WS2812 frames + reset gaps */
@@ -8504,7 +8502,6 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 		   num_leds, stream_tag, readl(spec->mem_base + 0x104));
 
 	/* 3. Trigger stream transmission on HDA link */
-	disable_irq(codec->bus->core.irq);
 	snd_hdac_dsp_trigger(hstr, true);
 	/* WS2812 latches on the >50us reset gap after one frame. The 32KB buffer holds ~64
 	 * repeating frame+reset cycles; at ~1.4ms/frame a 15ms run transmits ~10 complete
@@ -8512,18 +8509,22 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 	 * (OpenRGB effects/theme changes) are not serialized behind a 1s blocking sleep. */
 	msleep(15);
 	snd_hdac_dsp_trigger(hstr, false);
-	enable_irq(codec->bus->core.irq);
 	codec_dbg(codec, "AE5 strip: trigger complete\n");
 
 	/* Teardown: clear 0x104 pin mux back to 0 */
 	writel(0x00000000, spec->mem_base + 0x104);
+
+	/* Restore descriptor control register */
+	if (hstr->sd_addr)
+		writeb(orig_sd_ctl, hstr->sd_addr);
+
 	snd_hdac_dsp_cleanup(hstr, &dmab);
 	snd_hda_power_down(codec);
 
 	return 0;
 }
 
-static void ae5_strip_write_test(struct hda_codec *codec)
+static int ae5_strip_write_test(struct hda_codec *codec)
 {
 	u32 red[10];
 	int i;
@@ -8532,7 +8533,7 @@ static void ae5_strip_write_test(struct hda_codec *codec)
 		red[i] = 0x00ff00; /* GRB: G=0, R=255, B=0 -> Red */
 
 	codec_info(codec, "AE5 strip: running test frame (10 Red LEDs)\n");
-	ae5_strip_send_frame(codec, red, 10);
+	return ae5_strip_send_frame(codec, red, 10);
 }
 
 static ssize_t ae5_strip_test_store(struct device *dev,
@@ -8541,7 +8542,16 @@ static ssize_t ae5_strip_test_store(struct device *dev,
 {
 	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
 	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
-	ae5_strip_write_test(codec);
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	mutex_lock(&spec->ae5_strip_mutex);
+	err = ae5_strip_write_test(codec);
+	mutex_unlock(&spec->ae5_strip_mutex);
+
+	if (err < 0)
+		return err;
+
 	return count;
 }
 static DEVICE_ATTR_WO(ae5_strip_test);
@@ -8549,16 +8559,22 @@ static DEVICE_ATTR_WO(ae5_strip_test);
 static ssize_t ae5_strip_leds_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
+	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
+	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	struct ca0132_spec *spec = codec->spec;
 	int i, len = 0;
 
-	for (i = 0; i < ae5_strip_cur_num_leds && len < PAGE_SIZE - 16; i++) {
-		u32 grb = ae5_strip_cur_colors[i];
+	mutex_lock(&spec->ae5_strip_mutex);
+	for (i = 0; i < spec->ae5_strip_cur_num_leds && len < PAGE_SIZE - 16; i++) {
+		u32 grb = spec->ae5_strip_cur_colors[i];
 		u8 g = (grb >> 16) & 0xff;
 		u8 r = (grb >> 8) & 0xff;
 		u8 b = grb & 0xff;
 		len += scnprintf(buf + len, PAGE_SIZE - len, "%s#%02x%02x%02x",
 				 i == 0 ? "" : ",", r, g, b);
 	}
+	mutex_unlock(&spec->ae5_strip_mutex);
+
 	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
 	return len;
 }
@@ -8569,6 +8585,7 @@ static ssize_t ae5_strip_leds_store(struct device *dev,
 {
 	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
 	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	struct ca0132_spec *spec = codec->spec;
 	u32 colors[AE5_STRIP_MAX_LEDS];
 	int num_leds = 0;
 	const char *p = buf;
@@ -8579,27 +8596,23 @@ static ssize_t ae5_strip_leds_store(struct device *dev,
 
 	while (*p && *p != '\n' && num_leds < AE5_STRIP_MAX_LEDS) {
 		unsigned int r = 0, g = 0, b = 0;
+		int n = 0;
+
 		while (*p == ' ' || *p == ',' || *p == '\t')
 			p++;
 		if (!*p || *p == '\n')
 			break;
 		if (*p == '#')
 			p++;
-		if (sscanf(p, "%02x%02x%02x", &r, &g, &b) == 3) {
+
+		if (sscanf(p, "%2x%2x%2x%n", &r, &g, &b, &n) == 3 && n == 6) {
 			colors[num_leds++] = ((g & 0xff) << 16) | ((r & 0xff) << 8) | (b & 0xff);
-			p += 6;
-		} else if (sscanf(p, "%u,%u,%u", &r, &g, &b) == 3) {
-			colors[num_leds++] = ((g & 0xff) << 16) | ((r & 0xff) << 8) | (b & 0xff);
-			while (*p && *p != ',' && *p != ' ' && *p != '\n')
-				p++;
-			while (*p == ',' || *p == ' ')
-				p++;
-			while (*p && *p != ',' && *p != ' ' && *p != '\n')
-				p++;
-			while (*p == ',' || *p == ' ')
-				p++;
-			while (*p && *p != ',' && *p != ' ' && *p != '\n')
-				p++;
+			p += n;
+		} else if (sscanf(p, "%u,%u,%u%n", &r, &g, &b, &n) == 3) {
+			colors[num_leds++] = ((min(g, 255U) & 0xff) << 16) |
+					     ((min(r, 255U) & 0xff) << 8) |
+					     (min(b, 255U) & 0xff);
+			p += n;
 		} else {
 			break;
 		}
@@ -8608,26 +8621,31 @@ static ssize_t ae5_strip_leds_store(struct device *dev,
 	if (num_leds == 0)
 		return -EINVAL;
 
+	mutex_lock(&spec->ae5_strip_mutex);
+
 	/* If 1 color is supplied, replicate it across all configured LEDs */
 	if (num_leds == 1) {
 		int i;
-		for (i = 1; i < ae5_strip_cur_num_leds; i++)
+		for (i = 1; i < spec->ae5_strip_cur_num_leds; i++)
 			colors[i] = colors[0];
-		num_leds = ae5_strip_cur_num_leds;
-	} else if (num_leds < ae5_strip_cur_num_leds) {
+		num_leds = spec->ae5_strip_cur_num_leds;
+	} else if (num_leds < spec->ae5_strip_cur_num_leds) {
 		/* Partial update: keep existing colors for downstream LEDs and send full frame */
 		int i;
-		for (i = num_leds; i < ae5_strip_cur_num_leds; i++)
-			colors[i] = ae5_strip_cur_colors[i];
-		num_leds = ae5_strip_cur_num_leds;
+		for (i = num_leds; i < spec->ae5_strip_cur_num_leds; i++)
+			colors[i] = spec->ae5_strip_cur_colors[i];
+		num_leds = spec->ae5_strip_cur_num_leds;
 	} else {
 		/* More colors supplied: expand strip count */
-		ae5_strip_cur_num_leds = num_leds;
+		spec->ae5_strip_cur_num_leds = num_leds;
 	}
 
-	memcpy(ae5_strip_cur_colors, colors, sizeof(u32) * num_leds);
+	memcpy(spec->ae5_strip_cur_colors, colors, sizeof(u32) * num_leds);
 
 	err = ae5_strip_send_frame(codec, colors, num_leds);
+
+	mutex_unlock(&spec->ae5_strip_mutex);
+
 	if (err < 0)
 		return err;
 
@@ -8638,7 +8656,16 @@ static DEVICE_ATTR_RW(ae5_strip_leds);
 static ssize_t ae5_strip_num_leds_show(struct device *dev,
 				       struct device_attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%d\n", ae5_strip_cur_num_leds);
+	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
+	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	struct ca0132_spec *spec = codec->spec;
+	int val;
+
+	mutex_lock(&spec->ae5_strip_mutex);
+	val = spec->ae5_strip_cur_num_leds;
+	mutex_unlock(&spec->ae5_strip_mutex);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
 }
 
 static ssize_t ae5_strip_num_leds_store(struct device *dev,
@@ -8647,14 +8674,35 @@ static ssize_t ae5_strip_num_leds_store(struct device *dev,
 {
 	struct hdac_device *hdev = container_of(dev, struct hdac_device, dev);
 	struct hda_codec *codec = container_of(hdev, struct hda_codec, core);
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int n;
+	int err;
+
 	if (kstrtouint(buf, 0, &n) || n == 0 || n > AE5_STRIP_MAX_LEDS)
 		return -EINVAL;
-	ae5_strip_cur_num_leds = n;
-	ae5_strip_send_frame(codec, ae5_strip_cur_colors, n);
+
+	mutex_lock(&spec->ae5_strip_mutex);
+	spec->ae5_strip_cur_num_leds = n;
+	err = ae5_strip_send_frame(codec, spec->ae5_strip_cur_colors, n);
+	mutex_unlock(&spec->ae5_strip_mutex);
+
+	if (err < 0)
+		return err;
+
 	return count;
 }
 static DEVICE_ATTR_RW(ae5_strip_num_leds);
+
+static struct attribute *ae5_strip_attrs[] = {
+	&dev_attr_ae5_strip_leds.attr,
+	&dev_attr_ae5_strip_num_leds.attr,
+	&dev_attr_ae5_strip_test.attr,
+	NULL,
+};
+
+static const struct attribute_group ae5_strip_attr_group = {
+	.attrs = ae5_strip_attrs,
+};
 
 static void ae5_setup_defaults(struct hda_codec *codec)
 {
@@ -9085,6 +9133,8 @@ static void ca0132_init_chip(struct hda_codec *codec)
 	unsigned int on;
 
 	mutex_init(&spec->chipio_mutex);
+	mutex_init(&spec->ae5_strip_mutex);
+	spec->ae5_strip_cur_num_leds = 10;
 
 	/*
 	 * The Windows driver always does this upon startup, which seems to
@@ -9916,19 +9966,6 @@ static int ca0132_init(struct hda_codec *codec)
 		ca0132_pe_switch_set(codec);
 	}
 
-	if (ca0132_quirk(spec) == QUIRK_AE5) {
-		int err;
-		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_leds);
-		if (err)
-			codec_warn(codec, "AE5 strip: create leds sysfs failed %d\n", err);
-		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_num_leds);
-		if (err)
-			codec_warn(codec, "AE5 strip: create num_leds sysfs failed %d\n", err);
-		err = device_create_file(&codec->core.dev, &dev_attr_ae5_strip_test);
-		if (err)
-			codec_warn(codec, "AE5 strip: create test sysfs failed %d\n", err);
-	}
-
 	return 0;
 }
 
@@ -9984,6 +10021,7 @@ static void ca0132_free(struct hda_codec *codec)
 	if (spec->mem_base)
 		pci_iounmap(codec->bus->pci, spec->mem_base);
 #endif
+	mutex_destroy(&spec->ae5_strip_mutex);
 	kfree(spec->spec_init_verbs);
 	kfree(codec->spec);
 }
@@ -10273,9 +10311,9 @@ static void ca0132_codec_remove(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_leds);
-	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_num_leds);
-	device_remove_file(&codec->core.dev, &dev_attr_ae5_strip_test);
+	if (ca0132_quirk(spec) == QUIRK_AE5)
+		sysfs_remove_group(&codec->core.dev.kobj, &ae5_strip_attr_group);
+
 	if (ca0132_quirk(spec) == QUIRK_ZXR_DBPRO)
 		return dbpro_free(codec);
 	else
@@ -10392,6 +10430,12 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		goto error;
 
 	ca0132_setup_unsol(codec);
+
+	if (ca0132_quirk(spec) == QUIRK_AE5) {
+		err = sysfs_create_group(&codec->core.dev.kobj, &ae5_strip_attr_group);
+		if (err)
+			codec_warn(codec, "AE5 strip: failed to create sysfs group: %d\n", err);
+	}
 
 	return 0;
 
