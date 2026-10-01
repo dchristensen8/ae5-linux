@@ -29,19 +29,19 @@ Waveform timing and signal integrity have been validated using a 24 MS/s Saleae 
 
 ## Kernel Module (`snd-hda-codec-ca0132`)
 
-The patched `snd-hda-codec-ca0132` module adds sysfs attributes under the codec device:
+The patched `snd-hda-codec-ca0132` module exposes external strip controls via standard ALSA card controls:
 
-* `/sys/bus/hdaudio/devices/hdaudioC*D*/ae5_strip_leds`: Write comma-separated `#RRGGBB` hex color values.
-* `/sys/bus/hdaudio/devices/hdaudioC*D*/ae5_strip_num_leds`: Read/write configured LED count.
-* `/sys/bus/hdaudio/devices/hdaudioC*D*/ae5_strip_test`: Trigger hardware diagnostic pattern.
+* `AE-5 LED Strip`: 300-byte volatile `BYTES` control holding up to 100 RGB triplets (Red, Green, Blue bytes per LED).
+* `AE-5 LED Strip Count`: Volatile `INTEGER` control (range 1–100) setting the number of active LEDs on the strip.
+
+Because these controls use `IFACE_CARD` and `SNDRV_CTL_ELEM_ACCESS_VOLATILE`, changes do not wake up audio daemons (PipeWire / PulseAudio) or trigger `alsactl store/restore`.
 
 ### Building and Loading
 
 ```bash
 cd kbuild
 make
-sudo rmmod snd_hda_codec_ca0132
-sudo insmod snd-hda-codec-ca0132.ko
+sudo ../reload-ae5.sh
 ```
 
 ---
@@ -49,17 +49,14 @@ sudo insmod snd-hda-codec-ca0132.ko
 ## OpenRGB Integration
 
 OpenRGB native Linux support communicates directly with this driver interface:
-- **Zone 0:** MMIO mapping of PCIe BAR2 (`resource2`).
-- **Zone 1:** Persistent sysfs writes to `ae5_strip_leds`.
+- **Zone 0 (Internal):** MMIO mapping of PCIe BAR2 (`/dev/mem` or `resource2`).
+- **Zone 1 (External Strip):** Native ALSA control ioctls on `/dev/snd/controlC*` targeting `"AE-5 LED Strip"` and `"AE-5 LED Strip Count"` (with legacy sysfs fallback).
 
 ### udev Rules (`/etc/udev/rules.d/99-creative-ae5.rules`)
 
 ```udev
-# Creative Sound BlasterX AE-5 BAR2 MMIO access
+# Creative Sound BlasterX AE-5 BAR2 MMIO access (for Zone 0 on-card LEDs)
 SUBSYSTEM=="pci", ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0012", RUN+="/bin/chmod 0666 /sys$env{DEVPATH}/resource2"
-
-# Creative Sound BlasterX AE-5 external strip sysfs access
-SUBSYSTEM=="hdaudio", ATTR{ae5_strip_leds}!="", RUN+="/bin/chmod 0666 /sys$env{DEVPATH}/ae5_strip_leds /sys$env{DEVPATH}/ae5_strip_num_leds"
 ```
 
 Reload rules with:

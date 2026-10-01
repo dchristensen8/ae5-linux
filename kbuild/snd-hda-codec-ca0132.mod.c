@@ -15,8 +15,8 @@ __section(".gnu.linkonce.this_module") = {
 };
 
 
-MODULE_INFO(depends, "snd-hda-codec,snd-hda-core,snd,snd-pcm");
+MODULE_INFO(depends, "snd-hda-core,snd-hda-codec-generic,snd-hda-codec,snd,snd-pcm");
 
 MODULE_ALIAS("hdaudio:v11020011r*a01*");
 
-MODULE_INFO(srcversion, "55955BFEDD534C914558D9B");
+MODULE_INFO(srcversion, "A3EBB1D418A626B675324A3");

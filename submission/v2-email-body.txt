@@ -1,0 +1,42 @@
+Hi Takashi,
+
+I went ahead and reworked it with an ALSA byte control instead of sysfs, and rolled in all your code cleanups for v2.
+
+I set up two controls using IFACE_CARD and volatile:
+- "AE-5 LED Strip": 300 bytes of RGB (up to 100 LEDs, 3 bytes each)
+- "AE-5 LED Strip Count": integer for setting the active strip length (1..100)
+
+I also took care of the other cleanups you mentioned (the BIT macro, guard(), lockdep, constants for the buffer/gap sizes, and looping the 4-channel BAR2 registers).
+
+Attached the v2 patch file. If you'd prefer anything named or laid out differently, just let me know!
+
+Thanks,
+Devin
+
+---
+
+The Sound BlasterX AE-5 and AE-5 Plus expose a 3-pin 5V addressable RGB
+header driven directly by the CA0113 PCIe-to-HD-Audio bridge. Rather
+than using the CA0132 DSP or MMIO GPIO, the CA0113 contains an
+autonomous HDA link sniffer that snoops a designated HDA DMA playback
+stream, extracts the 24-bit GRB color payload, and serializes it as
+800 kHz single-wire NRZ pulses to the strip (WS2812B protocol).
+
+Expose the strip through volatile card control elements:
+
+  "AE-5 LED Strip"        (RW, BYTES): 300-byte RGB payload representing
+                          up to 100 addressable LEDs (3 bytes per LED).
+  "AE-5 LED Strip Count"  (RW, INTEGER): Active LED count (1..100).
+
+The controls are marked with IFACE_CARD and SNDRV_CTL_ELEM_ACCESS_VOLATILE
+so changes do not trigger unnecessary audio daemon wakeups or state
+restoration by alsactl.
+
+Writes allocate an idle HDA playback stream, format a 32 KB DMA buffer
+populated with repeating WS2812 frames (preamble, audio words per LED,
+and reset gap), configure the CA0113 BAR2 serializers and stream-tag
+pin mux, and pulse the stream long enough for the reset latch to fire.
+Access is serialized with a per-spec mutex, and the controls are only
+registered on QUIRK_AE5 devices.
+
+Signed-off-by: Devin Christensen <dchristensen8@proton.me>
