@@ -19,4 +19,4 @@ MODULE_INFO(depends, "snd-hda-core,snd-hda-codec-generic,snd-hda-codec,snd,snd-p
 
 MODULE_ALIAS("hdaudio:v11020011r*a01*");
 
-MODULE_INFO(srcversion, "A3EBB1D418A626B675324A3");
+MODULE_INFO(srcversion, "70B5C8BD37231AF2FAF99FD");

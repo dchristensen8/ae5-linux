@@ -1,14 +1,8 @@
 Hi Takashi,
 
-I went ahead and reworked it with an ALSA byte control instead of sysfs, and rolled in all your code cleanups for v2.
+Thanks! I updated it to use CLASS(snd_hda_power_pm, pm)(codec) for the power management call, which cleaned up all the manual power-down error exits nicely.
 
-I set up two controls using IFACE_CARD and volatile:
-- "AE-5 LED Strip": 300 bytes of RGB (up to 100 LEDs, 3 bytes each)
-- "AE-5 LED Strip Count": integer for setting the active strip length (1..100)
-
-I also took care of the other cleanups you mentioned (the BIT macro, guard(), lockdep, constants for the buffer/gap sizes, and looping the 4-channel BAR2 registers).
-
-Attached the v2 patch file. If you'd prefer anything named or laid out differently, just let me know!
+Attached is the proper v2 patch for upstreaming.
 
 Thanks,
 Devin

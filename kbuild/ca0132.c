@@ -8416,7 +8416,7 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 
 	lockdep_assert_held(&spec->ae5_strip_mutex);
 
-	snd_hda_power_up(codec);
+	CLASS(snd_hda_power_pm, pm)(codec);
 
 	/*
 	 * 44.1kHz, 24-bit, 2-channel format (0x4031) matches Windows CtxHda
@@ -8429,7 +8429,6 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 		if (!hstr) {
 			if (--retries <= 0) {
 				codec_warn(codec, "AE5 strip: no free azx stream after retries\n");
-				snd_hda_power_down(codec);
 				return -EBUSY;
 			}
 			usleep_range(5000, 10000);
@@ -8444,7 +8443,6 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 		if (--retries <= 0) {
 			codec_warn(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d\n",
 				   (int)stream_tag);
-			snd_hda_power_down(codec);
 			return (int)stream_tag;
 		}
 		usleep_range(5000, 10000);
@@ -8557,8 +8555,6 @@ static int ae5_strip_send_frame(struct hda_codec *codec, const u32 *grb_colors, 
 		writeb(orig_sd_ctl, hstr->sd_addr);
 
 	snd_hdac_dsp_cleanup(hstr, &dmab);
-	snd_hda_power_down(codec);
-
 	return 0;
 }
 

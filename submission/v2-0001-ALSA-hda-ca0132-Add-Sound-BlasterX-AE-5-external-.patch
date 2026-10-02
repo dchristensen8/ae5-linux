@@ -1,4 +1,4 @@
-From 69aec5e8836f8874e16663cd364ac5887ad85645 Mon Sep 17 00:00:00 2001
+From d1638d95a2d52faf1303c14e2f696a0d8097fb6f Mon Sep 17 00:00:00 2001
 From: Devin Christensen <dchristensen8@proton.me>
 Date: Wed, 30 Sep 2026 10:09:17 -0400
 Subject: [PATCH v2] ALSA: hda/ca0132: Add Sound BlasterX AE-5 external RGB LED
@@ -30,25 +30,22 @@ registered on QUIRK_AE5 devices.
 
 Signed-off-by: Devin Christensen <dchristensen8@proton.me>
 ---
-v1 -> v2:
- - Replaced sysfs attributes with ALSA control elements as suggested by Takashi:
-   * "AE-5 LED Strip" (300-byte RW BYTES control for up to 100 RGB LEDs)
-   * "AE-5 LED Strip Count" (RW INTEGER control for active strip length 1..100)
-   * Marked with IFACE_CARD and SNDRV_CTL_ELEM_ACCESS_VOLATILE to prevent
-     spurious wakeups in PipeWire/PulseAudio and avoid state restoration in alsactl.
-   * Dropped sysfs attributes and Documentation/ABI file.
- - Cleaned up ae5_strip_encode_24() using BIT() macro logic.
- - Converted ae5_strip_find_stream() to guard(spinlock_irqsave)(&bus->reg_lock).
- - Added lockdep_assert_held(&spec->ae5_strip_mutex) in ae5_strip_send_frame().
- - Replaced magic numbers with named constants (AE5_STRIP_DMA_SIZE, etc.).
- - Collapsed the 4-channel CA0113 BAR2 serializer register writes into loops
-   with stride 0x40.
+v2:
+ - Switch from sysfs attributes to ALSA card control elements ("AE-5 LED Strip"
+   and "AE-5 LED Strip Count") with IFACE_CARD and SNDRV_CTL_ELEM_ACCESS_VOLATILE.
+ - Drop Documentation/ABI/testing/sysfs-devices-sound-ae5.
+ - Use CLASS(snd_hda_power_pm, pm)(codec) for power management cleanup.
+ - Use guard(spinlock_irqsave)(&bus->reg_lock) in stream lookup.
+ - Add lockdep_assert_held(&spec->ae5_strip_mutex) in ae5_strip_send_frame().
+ - Simplify 24-bit bit-encoding with BIT() macro logic.
+ - Collapse CA0113 serializer register configuration into 4-channel loops.
+ - Define named constants for magic DMA and word calculation offsets.
 
- sound/hda/codecs/ca0132.c | 373 +++++++++++++++++++++++++++++++++++++-
- 1 file changed, 372 insertions(+), 1 deletion(-)
+ sound/hda/codecs/ca0132.c | 369 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 368 insertions(+), 1 deletion(-)
 
 diff --git a/sound/hda/codecs/ca0132.c b/sound/hda/codecs/ca0132.c
-index 0f8fb62f0..c6eaef5d5 100644
+index 0f8fb62f..89580091 100644
 --- a/sound/hda/codecs/ca0132.c
 +++ b/sound/hda/codecs/ca0132.c
 @@ -35,6 +35,8 @@
@@ -101,7 +98,7 @@ index 0f8fb62f0..c6eaef5d5 100644
  	case QUIRK_AE7:
  		err = ae5_add_headphone_gain_enum(codec);
  		if (err < 0)
-@@ -8316,8 +8331,361 @@ static void sbz_setup_defaults(struct hda_codec *codec)
+@@ -8316,8 +8331,357 @@ static void sbz_setup_defaults(struct hda_codec *codec)
  }
  
  /*
@@ -191,7 +188,7 @@ index 0f8fb62f0..c6eaef5d5 100644
 +
 +	lockdep_assert_held(&spec->ae5_strip_mutex);
 +
-+	snd_hda_power_up(codec);
++	CLASS(snd_hda_power_pm, pm)(codec);
 +
 +	/*
 +	 * 44.1kHz, 24-bit, 2-channel format (0x4031) matches Windows CtxHda
@@ -204,7 +201,6 @@ index 0f8fb62f0..c6eaef5d5 100644
 +		if (!hstr) {
 +			if (--retries <= 0) {
 +				codec_warn(codec, "AE5 strip: no free azx stream after retries\n");
-+				snd_hda_power_down(codec);
 +				return -EBUSY;
 +			}
 +			usleep_range(5000, 10000);
@@ -219,7 +215,6 @@ index 0f8fb62f0..c6eaef5d5 100644
 +		if (--retries <= 0) {
 +			codec_warn(codec, "AE5 strip: snd_hdac_dsp_prepare failed %d\n",
 +				   (int)stream_tag);
-+			snd_hda_power_down(codec);
 +			return (int)stream_tag;
 +		}
 +		usleep_range(5000, 10000);
@@ -332,8 +327,6 @@ index 0f8fb62f0..c6eaef5d5 100644
 +		writeb(orig_sd_ctl, hstr->sd_addr);
 +
 +	snd_hdac_dsp_cleanup(hstr, &dmab);
-+	snd_hda_power_down(codec);
-+
 +	return 0;
 +}
 +
@@ -464,7 +457,7 @@ index 0f8fb62f0..c6eaef5d5 100644
  static void ae5_setup_defaults(struct hda_codec *codec)
  {
  	struct ca0132_spec *spec = codec->spec;
-@@ -8741,6 +9109,8 @@ static void ca0132_init_chip(struct hda_codec *codec)
+@@ -8741,6 +9105,8 @@ static void ca0132_init_chip(struct hda_codec *codec)
  	unsigned int on;
  
  	mutex_init(&spec->chipio_mutex);
@@ -473,7 +466,7 @@ index 0f8fb62f0..c6eaef5d5 100644
  
  	/*
  	 * The Windows driver always does this upon startup, which seems to
-@@ -9627,6 +9997,7 @@ static void ca0132_free(struct hda_codec *codec)
+@@ -9627,6 +9993,7 @@ static void ca0132_free(struct hda_codec *codec)
  	if (spec->mem_base)
  		pci_iounmap(codec->bus->pci, spec->mem_base);
  #endif
