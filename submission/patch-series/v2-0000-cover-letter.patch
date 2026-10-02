@@ -1,0 +1,43 @@
+From 5e2eb70e3a73d3a8572b89f4b488f386cff05d9a Mon Sep 17 00:00:00 2001
+From: Devin Christensen <dchristensen8@proton.me>
+Date: Thu, 1 Oct 2026 21:59:22 -0400
+Subject: [PATCH v2 0/2] ALSA: hda/ca0132: Sound BlasterX AE-5 RGB lighting support
+
+This series adds complete driver support for the RGB lighting systems on
+the Creative Sound BlasterX AE-5 and AE-5 Plus sound cards.
+
+The AE-5 hardware contains two distinct RGB lighting zones:
+1. External 3-pin 5V addressable RGB header (WS2812B protocol, up to 100 LEDs):
+   Driven via the CA0113 PCIe-to-HDA bridge's autonomous DMA link sniffer,
+   which snoops a designated 44.1kHz 24-bit playback stream and serializes
+   the 24-bit color payload at 800 kHz.
+2. On-board logo and shroud accent lighting (APA102 protocol, 5 LEDs):
+   Driven directly by CA0113 bridge GPIO pins 2 (data) and 3 (clock) at
+   MMIO offset 0x320 on PCIe BAR2.
+
+Both zones are exposed to userspace through volatile card control elements:
+  - "AE-5 LED Strip"        (RW, BYTES): 300-byte RGB payload for external strip
+  - "AE-5 LED Strip Count"  (RW, INTEGER): Active LED count (1..100)
+  - "AE-5 On-Card LEDs"     (RW, BYTES): 15-byte RGB payload for 5 on-board LEDs
+
+Exposing both lighting zones through standard ALSA card controls allows userspace
+lighting software (such as OpenRGB) to control the card completely via standard
+/dev/snd/controlC* devices, eliminating the need for /dev/mem, PCIe resource sysfs
+mmap, or root privileges.
+
+Changes in v2:
+  - Updated power management in ae5_strip_send_frame() to use RAII
+    CLASS(snd_hda_power_pm, pm)(codec) as suggested by Takashi Iwai.
+  - Added patch 2/2 to expose the 5 on-board APA102 LEDs through the matching
+    "AE-5 On-Card LEDs" volatile control element.
+
+Devin Christensen (2):
+  ALSA: hda/ca0132: Add Sound BlasterX AE-5 external RGB LED strip
+    support
+  ALSA: hda/ca0132: Add Sound BlasterX AE-5 on-card RGB LED support
+
+ sound/hda/codecs/ca0132.c | 458 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 457 insertions(+), 1 deletion(-)
+
+-- 
+2.55.0

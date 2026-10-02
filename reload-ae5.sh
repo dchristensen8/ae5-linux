@@ -21,8 +21,8 @@ insmod "$KO" && echo "OK: ca0132 module loaded"
 echo "$COD" > /sys/bus/hdaudio/drivers/$DRV/bind 2>/dev/null || true
 sleep 2
 pkill -CONT wireplumber 2>/dev/null || true
-echo "=== verify strip ALSA controls ==="
-amixer -c Creative controls | grep -i "AE-5 LED Strip" || true
+echo "=== verify ALSA controls ==="
+amixer -c Creative controls | grep -E -i "AE-5 (LED Strip|On-Card LEDs)" || true
 amixer -c Creative cget iface=CARD,name='AE-5 LED Strip Count' 2>/dev/null || true
 
 # Optional: restart openrgb-server if present

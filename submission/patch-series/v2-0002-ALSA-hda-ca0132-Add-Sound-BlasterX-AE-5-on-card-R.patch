@@ -1,0 +1,162 @@
+From 5e2eb70e3a73d3a8572b89f4b488f386cff05d9a Mon Sep 17 00:00:00 2001
+From: Devin Christensen <dchristensen8@proton.me>
+Date: Thu, 1 Oct 2026 21:58:37 -0400
+Subject: [PATCH v2 2/2] ALSA: hda/ca0132: Add Sound BlasterX AE-5 on-card RGB
+ LED support
+
+The Sound BlasterX AE-5 and AE-5 Plus feature 5 on-board APA102
+(DotStar) RGB LEDs providing logo and shroud accent illumination.
+These LEDs are driven directly by CA0113 bridge GPIO pin 2 (data)
+and pin 3 (clock) mapped through PCIe BAR2 at MMIO offset 0x320.
+
+Expose the on-board LEDs through a volatile card control element:
+
+  "AE-5 On-Card LEDs"  (RW, BYTES): 15-byte RGB payload representing
+                       the 5 on-board LEDs (3 bytes per LED).
+
+Writes bit-bang the 32-bit start frame, 5 APA102 LED frames (8-bit
+brightness and 24-bit BGR color), and 32-bit end frame over GPIO
+pins 2 and 3, and leave the pins idle low. Access is serialized
+using spec->ae5_strip_mutex to prevent concurrent MMIO register
+access with the external LED strip, and codec power is managed
+via CLASS(snd_hda_power_pm, pm)(codec).
+
+This allows userspace RGB lighting controllers (such as OpenRGB) to
+drive both the on-card LEDs and the external strip purely through
+standard ALSA card control devices (/dev/snd/controlC*) without
+requiring /dev/mem, PCIe resource sysfs mmap, or root privileges.
+
+Signed-off-by: Devin Christensen <dchristensen8@proton.me>
+---
+ sound/hda/codecs/ca0132.c | 91 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/sound/hda/codecs/ca0132.c b/sound/hda/codecs/ca0132.c
+index 89580091..6071cfb0 100644
+--- a/sound/hda/codecs/ca0132.c
++++ b/sound/hda/codecs/ca0132.c
+@@ -1063,6 +1063,7 @@ enum dsp_download_state {
+  */
+ 
+ #define AE5_STRIP_MAX_LEDS 100
++#define AE5_ONCARD_LEDS 5
+ 
+ struct ca0132_spec {
+ 	struct hda_gen_spec gen;
+@@ -1167,10 +1168,11 @@ struct ca0132_spec {
+ 	 */
+ 	bool use_alt_controls;
+ 
+-	/* AE-5 WS2812 strip control */
++	/* AE-5 WS2812 strip and on-card LED control */
+ 	struct mutex ae5_strip_mutex;
+ 	u32 ae5_strip_cur_colors[AE5_STRIP_MAX_LEDS];
+ 	int ae5_strip_cur_num_leds;
++	u8 ae5_oncard_cur_colors[AE5_ONCARD_LEDS * 3];
+ };
+ 
+ /*
+@@ -8648,6 +8650,84 @@ static int ae5_strip_num_leds_put(struct snd_kcontrol *kcontrol,
+ 	return 0;
+ }
+ 
++static void ae5_oncard_write_bit(struct ca0132_spec *spec, bool bit)
++{
++	writew(bit ? 0x102 : 0x002, spec->mem_base + 0x320);
++	writew(0x103, spec->mem_base + 0x320);
++	writew(0x003, spec->mem_base + 0x320);
++}
++
++/*
++ * Caller must hold spec->ae5_strip_mutex.
++ */
++static void ae5_oncard_send_frame(struct hda_codec *codec, const u8 *rgb_colors)
++{
++	struct ca0132_spec *spec = codec->spec;
++	int i, bit;
++
++	if (!spec || !spec->mem_base)
++		return;
++
++	lockdep_assert_held(&spec->ae5_strip_mutex);
++	CLASS(snd_hda_power_pm, pm)(codec);
++
++	/* Start frame: 32 zeroes */
++	for (i = 0; i < 32; i++)
++		ae5_oncard_write_bit(spec, false);
++
++	/* 5 APA102 LEDs: 8-bit brightness (0xFF), Blue, Green, Red */
++	for (i = 0; i < AE5_ONCARD_LEDS; i++) {
++		u8 r = rgb_colors[i * 3 + 0];
++		u8 g = rgb_colors[i * 3 + 1];
++		u8 b = rgb_colors[i * 3 + 2];
++		u32 val = 0xff000000 | ((u32)b << 16) | ((u32)g << 8) | (u32)r;
++
++		for (bit = 31; bit >= 0; bit--)
++			ae5_oncard_write_bit(spec, (val >> bit) & 1);
++	}
++
++	/* End frame: 32 ones */
++	for (i = 0; i < 32; i++)
++		ae5_oncard_write_bit(spec, true);
++
++	/* Return GPIO pins 2 (data) and 3 (clock) to idle low */
++	ca0113_mmio_gpio_set(codec, 2, false);
++	ca0113_mmio_gpio_set(codec, 3, false);
++}
++
++static int ae5_oncard_ctl_info(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_info *uinfo)
++{
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
++	uinfo->count = AE5_ONCARD_LEDS * 3;
++	return 0;
++}
++
++static int ae5_oncard_ctl_get(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct ca0132_spec *spec = codec->spec;
++
++	guard(mutex)(&spec->ae5_strip_mutex);
++	memcpy(ucontrol->value.bytes.data, spec->ae5_oncard_cur_colors,
++	       AE5_ONCARD_LEDS * 3);
++	return 0;
++}
++
++static int ae5_oncard_ctl_put(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
++	struct ca0132_spec *spec = codec->spec;
++
++	guard(mutex)(&spec->ae5_strip_mutex);
++	memcpy(spec->ae5_oncard_cur_colors, ucontrol->value.bytes.data,
++	       AE5_ONCARD_LEDS * 3);
++	ae5_oncard_send_frame(codec, spec->ae5_oncard_cur_colors);
++	return 0;
++}
++
+ static const struct snd_kcontrol_new ae5_strip_ctls[] = {
+ 	{
+ 		.iface = SNDRV_CTL_ELEM_IFACE_CARD,
+@@ -8667,6 +8747,15 @@ static const struct snd_kcontrol_new ae5_strip_ctls[] = {
+ 		.get = ae5_strip_num_leds_get,
+ 		.put = ae5_strip_num_leds_put,
+ 	},
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_CARD,
++		.name = "AE-5 On-Card LEDs",
++		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
++			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
++		.info = ae5_oncard_ctl_info,
++		.get = ae5_oncard_ctl_get,
++		.put = ae5_oncard_ctl_put,
++	},
+ };
+ 
+ static int ae5_add_strip_controls(struct hda_codec *codec)
+-- 
+2.55.0
+
