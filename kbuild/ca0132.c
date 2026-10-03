@@ -18,6 +18,7 @@
 #include <linux/types.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/dma-mapping.h>
 #include <asm/io.h>
 #include <sound/core.h>
 #include <sound/hda_codec.h>
@@ -34,8 +35,6 @@
 #ifdef ENABLE_TUNING_CONTROLS
 #include <sound/tlv.h>
 #endif
-
-#include <linux/dma-mapping.h>
 
 #define FLOAT_ZERO	0x00000000
 #define FLOAT_ONE	0x3f800000
@@ -1063,7 +1062,6 @@ enum dsp_download_state {
  */
 
 #define AE5_STRIP_MAX_LEDS 100
-#define AE5_ONCARD_LEDS 5
 
 struct ca0132_spec {
 	struct hda_gen_spec gen;
@@ -1168,11 +1166,12 @@ struct ca0132_spec {
 	 */
 	bool use_alt_controls;
 
-	/* AE-5 WS2812 strip and on-card LED control */
+#if IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER)
+	/* AE-5 WS2812 strip control */
 	struct mutex ae5_strip_mutex;
 	u32 ae5_strip_cur_colors[AE5_STRIP_MAX_LEDS];
 	int ae5_strip_cur_num_leds;
-	u8 ae5_oncard_cur_colors[AE5_ONCARD_LEDS * 3];
+#endif
 };
 
 /*
@@ -6857,7 +6856,14 @@ static int ca0132_alt_add_mic_boost_enum(struct hda_codec *codec)
 
 }
 
+#if IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER)
 static int ae5_add_strip_controls(struct hda_codec *codec);
+#else
+static inline int ae5_add_strip_controls(struct hda_codec *codec)
+{
+	return 0;
+}
+#endif
 
 /*
  * Add headphone gain enumerated control for the AE-5. This switches between
@@ -8335,6 +8341,7 @@ static void sbz_setup_defaults(struct hda_codec *codec)
 /*
  * Sound BlasterX AE-5 External WS2812B RGB LED Strip Transport
  */
+#if IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER)
 #define AE5_STRIP_DMA_SIZE		0x8000
 #define AE5_STRIP_TOTAL_WORDS		(AE5_STRIP_DMA_SIZE / sizeof(u32))
 #define AE5_STRIP_PREAMBLE_WORDS	5
@@ -8382,7 +8389,7 @@ static struct hdac_stream *ae5_strip_find_stream(struct hda_codec *codec)
 	list_for_each_entry(s, &bus->stream_list, list) {
 		if (s->direction != SNDRV_PCM_STREAM_PLAYBACK)
 			continue;
-		if (s->running || s->locked)
+		if (s->opened || s->running || s->locked)
 			continue;
 		if (!first)
 			first = s;
@@ -8595,7 +8602,7 @@ static int ae5_strip_ctl_put(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 	u32 colors[AE5_STRIP_MAX_LEDS];
-	int i, num_leds;
+	int i, num_leds, change;
 
 	guard(mutex)(&spec->ae5_strip_mutex);
 	num_leds = spec->ae5_strip_cur_num_leds;
@@ -8606,9 +8613,13 @@ static int ae5_strip_ctl_put(struct snd_kcontrol *kcontrol,
 
 		colors[i] = ((u32)g << 16) | ((u32)r << 8) | (u32)b;
 	}
-	memcpy(spec->ae5_strip_cur_colors, colors, sizeof(u32) * num_leds);
+	change = memcmp(spec->ae5_strip_cur_colors, colors,
+			sizeof(u32) * num_leds) != 0;
+	if (change)
+		memcpy(spec->ae5_strip_cur_colors, colors,
+		       sizeof(u32) * num_leds);
 	ae5_strip_send_frame(codec, colors, num_leds);
-	return 0;
+	return change;
 }
 
 static int ae5_strip_num_leds_info(struct snd_kcontrol *kcontrol,
@@ -8647,85 +8658,7 @@ static int ae5_strip_num_leds_put(struct snd_kcontrol *kcontrol,
 		return 0;
 	spec->ae5_strip_cur_num_leds = val;
 	ae5_strip_send_frame(codec, spec->ae5_strip_cur_colors, val);
-	return 0;
-}
-
-static void ae5_oncard_write_bit(struct ca0132_spec *spec, bool bit)
-{
-	writew(bit ? 0x102 : 0x002, spec->mem_base + 0x320);
-	writew(0x103, spec->mem_base + 0x320);
-	writew(0x003, spec->mem_base + 0x320);
-}
-
-/*
- * Caller must hold spec->ae5_strip_mutex.
- */
-static void ae5_oncard_send_frame(struct hda_codec *codec, const u8 *rgb_colors)
-{
-	struct ca0132_spec *spec = codec->spec;
-	int i, bit;
-
-	if (!spec || !spec->mem_base)
-		return;
-
-	lockdep_assert_held(&spec->ae5_strip_mutex);
-	CLASS(snd_hda_power_pm, pm)(codec);
-
-	/* Start frame: 32 zeroes */
-	for (i = 0; i < 32; i++)
-		ae5_oncard_write_bit(spec, false);
-
-	/* 5 APA102 LEDs: 8-bit brightness (0xFF), Blue, Green, Red */
-	for (i = 0; i < AE5_ONCARD_LEDS; i++) {
-		u8 r = rgb_colors[i * 3 + 0];
-		u8 g = rgb_colors[i * 3 + 1];
-		u8 b = rgb_colors[i * 3 + 2];
-		u32 val = 0xff000000 | ((u32)b << 16) | ((u32)g << 8) | (u32)r;
-
-		for (bit = 31; bit >= 0; bit--)
-			ae5_oncard_write_bit(spec, (val >> bit) & 1);
-	}
-
-	/* End frame: 32 ones */
-	for (i = 0; i < 32; i++)
-		ae5_oncard_write_bit(spec, true);
-
-	/* Return GPIO pins 2 (data) and 3 (clock) to idle low */
-	ca0113_mmio_gpio_set(codec, 2, false);
-	ca0113_mmio_gpio_set(codec, 3, false);
-}
-
-static int ae5_oncard_ctl_info(struct snd_kcontrol *kcontrol,
-			       struct snd_ctl_elem_info *uinfo)
-{
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
-	uinfo->count = AE5_ONCARD_LEDS * 3;
-	return 0;
-}
-
-static int ae5_oncard_ctl_get(struct snd_kcontrol *kcontrol,
-			      struct snd_ctl_elem_value *ucontrol)
-{
-	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
-	struct ca0132_spec *spec = codec->spec;
-
-	guard(mutex)(&spec->ae5_strip_mutex);
-	memcpy(ucontrol->value.bytes.data, spec->ae5_oncard_cur_colors,
-	       AE5_ONCARD_LEDS * 3);
-	return 0;
-}
-
-static int ae5_oncard_ctl_put(struct snd_kcontrol *kcontrol,
-			      struct snd_ctl_elem_value *ucontrol)
-{
-	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
-	struct ca0132_spec *spec = codec->spec;
-
-	guard(mutex)(&spec->ae5_strip_mutex);
-	memcpy(spec->ae5_oncard_cur_colors, ucontrol->value.bytes.data,
-	       AE5_ONCARD_LEDS * 3);
-	ae5_oncard_send_frame(codec, spec->ae5_oncard_cur_colors);
-	return 0;
+	return 1;
 }
 
 static const struct snd_kcontrol_new ae5_strip_ctls[] = {
@@ -8747,15 +8680,6 @@ static const struct snd_kcontrol_new ae5_strip_ctls[] = {
 		.get = ae5_strip_num_leds_get,
 		.put = ae5_strip_num_leds_put,
 	},
-	{
-		.iface = SNDRV_CTL_ELEM_IFACE_CARD,
-		.name = "AE-5 On-Card LEDs",
-		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
-		.info = ae5_oncard_ctl_info,
-		.get = ae5_oncard_ctl_get,
-		.put = ae5_oncard_ctl_put,
-	},
 };
 
 static int ae5_add_strip_controls(struct hda_codec *codec)
@@ -8770,6 +8694,7 @@ static int ae5_add_strip_controls(struct hda_codec *codec)
 	}
 	return 0;
 }
+#endif /* CONFIG_SND_HDA_DSP_LOADER */
 
 static void ae5_setup_defaults(struct hda_codec *codec)
 {
@@ -9194,8 +9119,10 @@ static void ca0132_init_chip(struct hda_codec *codec)
 	unsigned int on;
 
 	mutex_init(&spec->chipio_mutex);
+#if IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER)
 	mutex_init(&spec->ae5_strip_mutex);
 	spec->ae5_strip_cur_num_leds = 10;
+#endif
 
 	/*
 	 * The Windows driver always does this upon startup, which seems to
@@ -10082,7 +10009,9 @@ static void ca0132_free(struct hda_codec *codec)
 	if (spec->mem_base)
 		pci_iounmap(codec->bus->pci, spec->mem_base);
 #endif
+#if IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER)
 	mutex_destroy(&spec->ae5_strip_mutex);
+#endif
 	kfree(spec->spec_init_verbs);
 	kfree(codec->spec);
 	codec->spec = NULL;

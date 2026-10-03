@@ -1,0 +1,52 @@
+Hi Takashi,
+
+Thanks for the detailed review! I've addressed all three points:
+
+- Moved linux/dma-mapping.h into the main header block alongside linux/pci.h.
+- Added the s->opened check in ae5_strip_find_stream() to avoid grabbing a
+  stream that's being opened by userspace.
+- Guarded all strip-related code (struct fields, encode/find/send helpers,
+  controls, mutex init/destroy) with IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER),
+  with a no-op inline stub for ae5_add_strip_controls() when the option is
+  disabled.
+- Updated ae5_strip_ctl_put() to return 1 when the values change (using
+  memcmp against the cached colors), and ae5_strip_num_leds_put() to return 1
+  unconditionally when it makes a change.
+
+Attached is v3.
+
+Thanks,
+Devin
+
+---
+
+The Sound BlasterX AE-5 and AE-5 Plus expose a 3-pin 5V addressable RGB
+header driven directly by the CA0113 PCIe-to-HD-Audio bridge. Rather
+than using the CA0132 DSP or MMIO GPIO, the CA0113 contains an
+autonomous HDA link sniffer that snoops a designated HDA DMA playback
+stream, extracts the 24-bit GRB color payload, and serializes it as
+800 kHz single-wire NRZ pulses to the strip (WS2812B protocol).
+
+Expose the strip through volatile card control elements:
+
+  "AE-5 LED Strip"        (RW, BYTES): 300-byte RGB payload representing
+                          up to 100 addressable LEDs (3 bytes per LED).
+  "AE-5 LED Strip Count"  (RW, INTEGER): Active LED count (1..100).
+
+The controls are marked with IFACE_CARD and SNDRV_CTL_ELEM_ACCESS_VOLATILE
+so changes do not trigger unnecessary audio daemon wakeups or state
+restoration by alsactl.
+
+Writes allocate an idle HDA playback stream, format a 32 KB DMA buffer
+populated with repeating WS2812 frames (preamble, audio words per LED,
+and reset gap), configure the CA0113 BAR2 serializers and stream-tag
+pin mux, and pulse the stream long enough for the reset latch to fire.
+Access is serialized with a per-spec mutex, and the controls are only
+registered on QUIRK_AE5 devices.
+
+The strip transport uses snd_hdac_dsp_prepare() / snd_hdac_dsp_cleanup(),
+which require CONFIG_SND_HDA_DSP_LOADER. All strip-related code and struct
+fields are therefore conditionally compiled under
+IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER).
+
+Signed-off-by: Devin Christensen <dchristensen8@proton.me>
