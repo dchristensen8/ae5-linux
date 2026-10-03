@@ -1,17 +1,10 @@
 Hi Takashi,
 
-Thanks for the detailed review! I've addressed all three points:
-
-- Moved linux/dma-mapping.h into the main header block alongside linux/pci.h.
-- Added the s->opened check in ae5_strip_find_stream() to avoid grabbing a
-  stream that's being opened by userspace.
-- Guarded all strip-related code (struct fields, encode/find/send helpers,
-  controls, mutex init/destroy) with IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER),
-  with a no-op inline stub for ae5_add_strip_controls() when the option is
-  disabled.
-- Updated ae5_strip_ctl_put() to return 1 when the values change (using
-  memcmp against the cached colors), and ae5_strip_num_leds_put() to return 1
-  unconditionally when it makes a change.
+Thanks for the review! I moved the dma-mapping.h include into the main
+header block, added the s->opened check to ae5_strip_find_stream(), wrapped
+all the strip code in IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER) with a no-op
+stub when it's disabled, and updated the put callbacks to return 1 when the
+values actually change.
 
 Attached is v3.
 
