@@ -1,5 +1,3 @@
-Hi Takashi,
-
 oops, that's embarrassing. Here's the proper patch.
 
 Thanks,
