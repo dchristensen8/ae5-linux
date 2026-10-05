@@ -1,12 +1,6 @@
 Hi Takashi,
 
-Thanks for the review! I moved the dma-mapping.h include into the main
-header block, added the s->opened check to ae5_strip_find_stream(), wrapped
-all the strip code in IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER) with a no-op
-stub when it's disabled, and updated the put callbacks to return 1 when the
-values actually change.
-
-Attached is v3.
+oops, that's embarrassing. Here's the proper patch.
 
 Thanks,
 Devin
@@ -39,7 +33,8 @@ registered on QUIRK_AE5 devices.
 
 The strip transport uses snd_hdac_dsp_prepare() / snd_hdac_dsp_cleanup(),
 which require CONFIG_SND_HDA_DSP_LOADER. All strip-related code and struct
-fields are therefore conditionally compiled under
-IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER).
+fields are conditionally compiled under
+IS_ENABLED(CONFIG_SND_HDA_DSP_LOADER), with a no-op stub for
+ae5_add_strip_controls() when disabled.
 
 Signed-off-by: Devin Christensen <dchristensen8@proton.me>
