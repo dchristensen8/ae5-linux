@@ -36,8 +36,6 @@ ae5_add_strip_controls() when disabled.
 
 Signed-off-by: Devin Christensen <dchristensen8@proton.me>
 ---
-oops, that's embarrassing. Here's the proper patch.
-
 v3:
  - Move #include <linux/dma-mapping.h> into main header block.
  - Check s->opened in ae5_strip_find_stream() to avoid stealing open streams.
